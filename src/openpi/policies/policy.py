@@ -2,7 +2,7 @@ from collections.abc import Sequence
 import logging
 import pathlib
 import time
-from typing import Any, TypeAlias
+from typing import Any, Tuple, TypeAlias
 
 import flax
 import flax.traverse_util
@@ -32,6 +32,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
     ):
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        self._get_encoding = nnx_utils.module_jit(model.get_encoding)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
@@ -50,7 +51,9 @@ class Policy(BasePolicy):
         self._rng, sample_rng = jax.random.split(self._rng)
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs),
+            "actions": self._sample_actions(
+                sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs
+            ),
         }
         # Unbatch and convert to np.ndarray.        # Unbatch and convert to np.ndarray.
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
@@ -61,6 +64,16 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def get_encoding(self, obs: dict) -> Tuple:
+        # Make a copy since transformations may modify the inputs in place.
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        # Make a batch and convert to jax.Array.
+        inputs = jax.tree.map(lambda x: jnp.asarray(x), inputs)
+        print(f"Inputs['state'].shape: {inputs['state'].shape}")
+
+        return self._get_encoding(_model.Observation.from_dict(inputs))
 
     @property
     def metadata(self) -> dict[str, Any]:

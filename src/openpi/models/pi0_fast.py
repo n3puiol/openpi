@@ -165,6 +165,7 @@ class Pi0FAST(_model.BaseModel):
         token_embeddings = []
         # embed images
         for name in obs.images:
+            print(f"Obs.images.shape: {obs.images[name].shape}")
             image_token_embeddings, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             token_embeddings.append(image_token_embeddings)
@@ -231,6 +232,13 @@ class Pi0FAST(_model.BaseModel):
         loss_mask = observation.token_loss_mask[:, 1:]
         token_pplx = jnp.sum(targets * logp, axis=-1)
         return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+
+    @override
+    def get_encoding(self, observation: _model.Observation)  -> tuple:
+        obs = _model.preprocess_observation(
+            None, observation, train=False, image_keys=list(observation.images.keys())
+        )
+        return self.embed_inputs(obs)
 
     @override
     def sample_actions(
