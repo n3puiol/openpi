@@ -12,7 +12,22 @@ def make_libero_example() -> dict:
     return {
         "observation/state": np.random.rand(8),
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image": np.random.randint(
+            256, size=(224, 224, 3), dtype=np.uint8
+        ),
+        "prompt": "do something",
+    }
+
+
+def make_multiframe_libero_example(num_frames: int) -> dict:
+    return {
+        "observation/state": np.random.rand(num_frames, 8),
+        "observation/image": np.random.randint(
+            256, size=(num_frames, 224, 224, 3), dtype=np.uint8
+        ),
+        "observation/wrist_image": np.random.randint(
+            256, size=(num_frames, 224, 224, 3), dtype=np.uint8
+        ),
         "prompt": "do something",
     }
 
@@ -44,6 +59,11 @@ class LiberoInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
+        if data["observation/state"].ndim == 2:
+            print("Multiframe variant")
+            return self.multiframe_variant(data)
+        print("Single frame variant")
+
         # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
         mask_padding = self.model_type == _model.ModelType.PI0
 
@@ -89,6 +109,74 @@ class LiberoInputs(transforms.DataTransformFn):
             # We are padding to the model action dim.
             # For pi0-FAST, this is a no-op (since action_dim = 7).
             actions = transforms.pad_to_dim(data["actions"], self.action_dim)
+            inputs["actions"] = actions
+
+        # Pass the prompt (aka language instruction) to the model.
+        # Keep this for your own dataset (but modify the key if the instruction is not
+        # stored in "prompt"; the output dict always needs to have the key "prompt").
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+    def multiframe_variant(self, data: dict) -> dict:
+        # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
+        mask_padding = self.model_type == _model.ModelType.PI0
+
+        # We pad the proprioceptive input to the action dimension of the model.
+        # For multi-frame data, we need to handle the temporal dimension
+        state = data["observation/state"]  # Shape: (num_frames, state_dim)
+        num_frames = state.shape[0]
+
+        # Pad each frame's state to the action dimension
+        padded_states = []
+        for frame_idx in range(num_frames):
+            frame_state = transforms.pad_to_dim(state[frame_idx], self.action_dim)
+            padded_states.append(frame_state)
+        state = np.stack(padded_states, axis=0)
+
+        # Parse multi-frame images to uint8 (num_frames, H, W, C)
+        base_images = []
+        wrist_images = []
+
+        for frame_idx in range(num_frames):
+            base_image = _parse_image(data["observation/image"][frame_idx])
+            wrist_image = _parse_image(data["observation/wrist_image"][frame_idx])
+            base_images.append(base_image)
+            wrist_images.append(wrist_image)
+
+        base_images = np.stack(base_images, axis=0)
+        wrist_images = np.stack(wrist_images, axis=0)
+
+        # Create inputs dict. Do not change the keys in the dict below.
+        inputs = {
+            "state": state,
+            "image": {
+                "base_0_rgb": base_images,
+                "left_wrist_0_rgb": wrist_images,
+                # Pad any non-existent images with zero-arrays of the appropriate shape.
+                "right_wrist_0_rgb": np.zeros_like(base_images),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                # Mask any non-existent images with False (if ``mask_padding`` is True).
+                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+            },
+        }
+
+        # Pad actions to the model action dimension. Keep this for your own dataset.
+        # Actions are only available during training.
+        if "actions" in data:
+            # Handle multi-frame actions
+            actions = data["actions"]  # Shape: (num_frames, action_dim)
+            padded_actions = []
+            for frame_idx in range(actions.shape[0]):
+                frame_action = transforms.pad_to_dim(
+                    actions[frame_idx], self.action_dim
+                )
+                padded_actions.append(frame_action)
+            actions = np.stack(padded_actions, axis=0)
             inputs["actions"] = actions
 
         # Pass the prompt (aka language instruction) to the model.
