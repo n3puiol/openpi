@@ -165,7 +165,6 @@ class Pi0FAST(_model.BaseModel):
         token_embeddings = []
         # embed images
         for name in obs.images:
-            print(f"Obs.images.shape: {obs.images[name].shape}")
             image_token_embeddings, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             token_embeddings.append(image_token_embeddings)
