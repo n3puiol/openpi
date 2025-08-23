@@ -137,10 +137,11 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    horizon = range(-action_horizon//2, action_horizon//2) if data_config.predictor else range(action_horizon)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in horizon] for key in data_config.action_sequence_keys
         },
     )
 
@@ -217,7 +218,6 @@ def transform_iterable_dataset(
         is_batched=is_batched,
     )
 
-
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -225,7 +225,7 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[tuple[_model.Observation, _model.Actions]] | dict:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -487,4 +487,8 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if self._data_config.predictor:
+                yield batch
+                # yield {key: batch[key] for key in self._data_config.action_sequence_keys}
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]

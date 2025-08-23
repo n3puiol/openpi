@@ -193,6 +193,10 @@ class Pi0FAST(_model.BaseModel):
             jnp.concatenate(input_mask, axis=1),
             jnp.concatenate(ar_mask, axis=1),
         )
+        
+    @override
+    def img_encode(self, images: at.Float[at.Array, "*b h w c"]) -> at.Float[at.Array, "*b s emb"]:
+        return self.PaliGemma.img(images, train=False)[0]
 
     @override
     def compute_loss(
@@ -231,13 +235,6 @@ class Pi0FAST(_model.BaseModel):
         loss_mask = observation.token_loss_mask[:, 1:]
         token_pplx = jnp.sum(targets * logp, axis=-1)
         return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
-
-    @override
-    def get_encoding(self, observation: _model.Observation)  -> tuple:
-        obs = _model.preprocess_observation(
-            None, observation, train=False, image_keys=list(observation.images.keys())
-        )
-        return self.embed_inputs(obs)
 
     @override
     def sample_actions(

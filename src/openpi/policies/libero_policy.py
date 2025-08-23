@@ -19,20 +19,16 @@ def make_libero_example() -> dict:
     }
 
 
-def make_multiframe_libero_example(num_frames: int) -> list[dict]:
-    return [
-        make_libero_example()
-        for _ in range(num_frames)
-    ]
-
-
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
-        image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+        image = (255 * image)
+    image_shape = image.shape
+    if len(image_shape) == 3 and image_shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
-    return image
+    elif len(image_shape) == 4 and image_shape[1] == 3:
+        image = einops.rearrange(image, "b c h w -> b h w c")
+    return image.astype(np.uint8)
 
 
 @dataclasses.dataclass(frozen=True)

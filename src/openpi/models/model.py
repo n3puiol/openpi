@@ -132,6 +132,7 @@ class Observation(Generic[ArrayT]):
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
+HorizonImages = at.Float[ArrayT, "*b t h w c"]
 
 
 def preprocess_observation(
@@ -255,9 +256,6 @@ class BaseModel(nnx.Module, abc.ABC):
     action_dim: int
     action_horizon: int
     max_token_len: int
-    
-    @abc.abstractmethod
-    def get_encoding(self, observation: Observation) -> Tuple: ...
 
     @abc.abstractmethod
     def compute_loss(
@@ -271,6 +269,9 @@ class BaseModel(nnx.Module, abc.ABC):
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
+    
+    @abc.abstractmethod
+    def img_encode(self, images: at.Float[at.Array, "*b h w c"]) -> at.Float[at.Array, "*b s emb"]: ...
 
 
 def restore_params(

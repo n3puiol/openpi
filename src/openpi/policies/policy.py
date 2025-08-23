@@ -31,8 +31,8 @@ class Policy(BasePolicy):
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ):
+        self.img_encode = nnx_utils.module_jit(model.img_encode)
         self._sample_actions = nnx_utils.module_jit(model.sample_actions)
-        self._get_encoding = nnx_utils.module_jit(model.get_encoding)
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._rng = rng or jax.random.key(0)
@@ -64,14 +64,6 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
-
-    def get_encoding(self, obs: dict) -> Tuple:
-        # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._input_transform(inputs)
-        # Make a batch and convert to jax.Array.
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-        return self._get_encoding(_model.Observation.from_dict(inputs))
 
     @property
     def metadata(self) -> dict[str, Any]:
