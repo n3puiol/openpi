@@ -70,9 +70,7 @@ class Policy(BasePolicy):
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         # Make a batch and convert to jax.Array.
-        inputs = jax.tree.map(lambda x: jnp.asarray(x), inputs)
-        print(f"Inputs['state'].shape: {inputs['state'].shape}")
-
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         return self._get_encoding(_model.Observation.from_dict(inputs))
 
     @property
