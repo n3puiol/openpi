@@ -22,24 +22,32 @@ class Predictor(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self._policy = policy
+        self._in_channel = in_channel
+        self._hidden_size = hidden_size
+        self._num_heads = num_heads
+        self._num_layers = num_layers
+
         self._rngs = rngs
 
         self._diffusion_transformer = DiffusionTransformer(
-            in_channel=in_channel,
-            dim=hidden_size,
-            num_heads=num_heads,
-            n_layers=num_layers,
-            rngs=rngs,
+            in_channel=self._in_channel,
+            dim=self._hidden_size,
+            num_heads=self._num_heads,
+            n_layers=self._num_layers,
+            rngs=self._rngs,
         )
-    
-    def get_siglip_encoding(self, images: _model.HorizonImages) -> at.Float[at.Array, "*b s emb"]:
+
+    def get_siglip_encoding(
+        self, images: _model.HorizonImages
+    ) -> at.Float[at.Array, "*b s emb"]:
         images = self.preprocess_images(images)
-        print(f"images.shape: {images.shape}")
         image_token_embeddings = self._policy.img_encode(images)
         return image_token_embeddings
 
-    def preprocess_images(self, images: _model.HorizonImages) -> at.Float[at.Array, "*b h w c"]:
-        images = jnp.reshape(images, (-1, *images.shape[2:])) # (B*t, H, W, C)
+    def preprocess_images(
+        self, images: _model.HorizonImages
+    ) -> at.Float[at.Array, "*b h w c"]:
+        images = jnp.reshape(images, (-1, *images.shape[2:]))  # (B*t, H, W, C)
         # Normalize images to [-1, 1]
         images = (images.astype(jnp.float32) / 127.5) - 1.0
         # TODO: add augmentation
@@ -59,27 +67,19 @@ class Predictor(nnx.Module):
     ):
         # TODO: explore using fast tokenizer for actions
         b, t, h, w, c = images.shape
-        horizon = t//2
-        
+        horizon = t // 2
+
         image_embeddings = self.get_siglip_encoding(images)
         _, s, p = image_embeddings.shape
-        print(f"image_embeddings.shape: {image_embeddings.shape}")
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
-        print(f"image_embeddings.shape: {image_embeddings.shape}")
 
         lc_his = image_embeddings[:, :horizon]  # (b, horizon, 256, 2048)
-        print(f"lc_his.shape: {lc_his.shape}")
         x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
-        print(f"x_prior.shape: {x_prior.shape}")
         lc_next = image_embeddings[:, horizon:]  # (b, horizon, 256, 2048)
-        print(f"lc_next.shape: {lc_next.shape}")
 
         res = jnp.concatenate([x_prior, lc_next], axis=1)
-        print(f"res.shape: {res.shape}")
         res = jnp.diff(res, axis=1) * 1
-        print(f"res.shape: {res.shape}")
         c_res = -1 * res  # Multiply by drift term to guide diffusion process
-        print(f"c_res.shape: {c_res.shape}")
 
         timestep = (
             jax.random.uniform(
@@ -88,10 +88,8 @@ class Predictor(nnx.Module):
             * (1.0 - self.eps)
             + self.eps
         )
-        print(f"timestep.shape: {timestep.shape}")
 
         noise = jax.random.normal(self._rngs(), shape=c_res.shape)
-        print(f"noise.shape: {noise.shape}")
 
         x_noisy = self.add_noise(
             res,
@@ -99,13 +97,15 @@ class Predictor(nnx.Module):
             timestep,
             c_res,
         )
-        print(f"x_noisy.shape: {x_noisy.shape}")
 
         y_pred, y_pred_tmp = self._diffusion_transformer(
             x_noisy, lc_his, actions, timestep
         )
-        print(f"y_pred.shape: {y_pred.shape}")
-        print(f"y_pred_tmp.shape: {y_pred_tmp.shape}")
+
+        loss = jnp.mean((y_pred - c_res) ** 2)
+        aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
+
+        return loss + aux_loss
 
 
 if __name__ == "__main__":
@@ -113,7 +113,7 @@ if __name__ == "__main__":
     from openpi.shared import download
     from openpi.training import config as _config
 
-    cpu_device = jax.devices('cpu')[0]
+    cpu_device = jax.devices("cpu")[0]
     print("CPU device:", cpu_device)
     with jax.default_device(cpu_device):
         config = _config.get_config("pi0_fast_libero_predictor")
@@ -130,4 +130,4 @@ if __name__ == "__main__":
         actions = jax.random.normal(key, (8, 4, 7))
         imgs = jax.random.normal(key, (8, 4, 224, 224, 3))
 
-        predictor.compute_loss(imgs, actions)
+        loss = predictor.compute_loss(imgs, actions)
