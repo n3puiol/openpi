@@ -17,6 +17,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_fast_predictor as pi0_fast_predictor
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -123,7 +124,7 @@ class ModelTransformFactory(GroupFactory):
                         ),
                     ],
                 )
-            case _model.ModelType.PI0_FAST:
+            case _model.ModelType.PI0_FAST | _model.ModelType.PI0_FAST_PREDICTOR:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
                     if model_config.fast_model_tokenizer is None
@@ -208,7 +209,7 @@ class SimpleDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs),
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
-            use_quantile_norm=model_config.model_type == ModelType.PI0_FAST,
+            use_quantile_norm=model_config.model_type == ModelType.PI0_FAST or model_config.model_type == ModelType.PI0_FAST_PREDICTOR,
         )
 
 
@@ -387,7 +388,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            use_quantile_norm=model_config.model_type == ModelType.PI0_FAST,
+            use_quantile_norm=model_config.model_type == ModelType.PI0_FAST or model_config.model_type == ModelType.PI0_FAST_PREDICTOR,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
         )
@@ -642,7 +643,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_fast_libero_predictor",
-        model=pi0_fast.Pi0FASTConfig(
+        model=pi0_fast_predictor.Pi0FASTPredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180,
         ),
         data=LeRobotLiberoDataConfig(
@@ -652,15 +653,12 @@ _CONFIGS = [
             ),
             base_config=DataConfig(prompt_from_task=True, predictor=True, action_sequence_keys=("actions", "image")),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        # Again, make sure to match the model config above when extracting the freeze filter
-        # that specifies which parameters should be frozen during LoRA finetuning.
-        freeze_filter=pi0_fast.Pi0FASTConfig(
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_libero/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_fast_libero_predictor/params"),
+        num_train_steps=2,
+        freeze_filter=pi0_fast_predictor.Pi0FASTPredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180,
         ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.

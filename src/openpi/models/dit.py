@@ -429,10 +429,13 @@ class VideoTransformer(nnx.Module):
     ):
         self.token = nnx.Param(jnp.zeros((1, 1, dim), dtype=jnp.float32))
         self.inp = nnx.Linear(in_channel, dim, rngs=rngs)
-        self.layers = [
-            TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs)
-            for _ in range(depth)
-        ]
+        self.blocks = nnx.Dict(
+            {f"block_{i}": TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs) for i in range(depth)}
+        )
+        # self.layers = [
+        #     TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs)
+        #     for _ in range(depth)
+        # ]
 
     def __call__(
         self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None
@@ -443,8 +446,10 @@ class VideoTransformer(nnx.Module):
         x = x.reshape(B * N, T, C)
         cls = jnp.tile(self.token.value, (B * N, 1, 1))
         x = jnp.concatenate([cls, x], axis=1)
-        for layer in self.layers:
-            x = layer(x, rngs=rngs)
+        for _, block in self.blocks.items():
+            x = block(x, rngs=rngs)
+        # for layer in self.layers:
+        #     x = layer(x, rngs=rngs)
         g = x[:, 0, :]
         return g.reshape(B, N, C)
 
@@ -477,7 +482,8 @@ class DiffusionTransformer(nnx.Module):
         self.time_encoder = TimestepEmbedder(dim, freq_dim=256, rngs=rngs)
         self.action_encoder = ActionEmbedder(dim, input_size=7, rngs=rngs)
         # Stacked DiT blocks (alternate spatial/temporal)
-        self.blocks = [DiTBlock(dim, num_heads, rngs=rngs) for _ in range(n_layers)]
+        # self.blocks = [DiTBlock(dim, num_heads, rngs=rngs) for _ in range(n_layers)]
+        self.blocks = nnx.Dict({f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs) for i in range(n_layers)})
         # Output heads
         self.comp = CompLayer(
             dim, out_channels=in_channel, num_heads=num_heads, rngs=rngs
@@ -518,7 +524,8 @@ class DiffusionTransformer(nnx.Module):
         # DiT stack
         for i, block in enumerate(self.blocks):
             mode = "spatial" if i % 2 == 0 else "temporal"
-            x = block(x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
+            x = self.blocks[f"block_{i}"](x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
+            # x = block(x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
         # Heads
         y_tmp = self.comp(x, v_fea, t_fea, act_fea, shape=shape, rngs=rngs)
         y = y_tmp + self.final(
