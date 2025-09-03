@@ -82,6 +82,7 @@ class Pi0FASTPredictor(Pi0FAST):
         lc_his = image_embeddings[:, :horizon]  # (b, horizon, 256, 2048)
         x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
         lc_next = image_embeddings[:, horizon:]  # (b, horizon, 256, 2048)
+        a_next = actions[:, horizon:]  # (b, horizon, 256, 2048)
 
         res = jnp.concatenate([x_prior, lc_next], axis=1)
         res = jnp.diff(res, axis=1) * 1
@@ -103,7 +104,7 @@ class Pi0FASTPredictor(Pi0FAST):
         )
 
         y_pred, y_pred_tmp = self._diffusion_transformer(
-            x_noisy, lc_his, actions, timestep
+            x_noisy, lc_his, a_next, timestep
         )
 
         loss = jnp.mean((y_pred - c_res) ** 2)

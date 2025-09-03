@@ -654,11 +654,12 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True, predictor=True, action_sequence_keys=("actions", "image")),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_libero/params"),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_fast_libero_predictor/params"),
         num_train_steps=2,
         freeze_filter=pi0_fast_predictor.Pi0FASTPredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180,
         ).get_freeze_filter(),
+        # ema_decay=None,
+        batch_size=4
     ),
     #
     # Fine-tuning Aloha configs.

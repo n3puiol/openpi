@@ -522,7 +522,7 @@ class DiffusionTransformer(nnx.Module):
         t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, C]
         act_fea = self.action_encoder(actions)  # [B, T, C]
         # DiT stack
-        for i, block in enumerate(self.blocks):
+        for i, _ in enumerate(self.blocks):
             mode = "spatial" if i % 2 == 0 else "temporal"
             x = self.blocks[f"block_{i}"](x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
             # x = block(x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
