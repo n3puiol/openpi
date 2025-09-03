@@ -644,7 +644,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_fast_libero_predictor",
         model=pi0_fast_predictor.Pi0FASTPredictorConfig(
-            action_dim=7, action_horizon=10, max_token_len=180,
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -656,10 +656,10 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_libero/params"),
         num_train_steps=2,
         freeze_filter=pi0_fast_predictor.Pi0FASTPredictorConfig(
-            action_dim=7, action_horizon=10, max_token_len=180,
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),
-        # ema_decay=None,
-        batch_size=4
+        batch_size=4,
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.

@@ -28,7 +28,10 @@ class Pi0FASTPredictorConfig(Pi0FASTConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0FASTPredictor":
-        return Pi0FASTPredictor(self, rngs=nnx.Rngs(rng))
+        # Construct Rngs with explicit param and dropout keys
+        k_params, k_dropout = jax.random.split(rng)  # type: ignore[arg-type]
+        rngs = nnx.Rngs(params=k_params, dropout=k_dropout)
+        return Pi0FASTPredictor(self, rngs=rngs)
     
     @override
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
@@ -69,45 +72,39 @@ class Pi0FASTPredictor(Pi0FAST):
     ) -> at.Float[at.Array, "*b ah"]:
         b, t, _ = actions.shape
         horizon = t // 2
+        # Preprocess observation and encode images
         observation = _model.preprocess_observation(
             rng, observation, train=train, image_keys=list(observation.images.keys())
         )
-
-        image_embeddings = self.img_encode(
-            observation.images[self._image_key]
-        )  # (b*t, 256, 2048)
+        image_embeddings = self.img_encode(observation.images[self._image_key])  # (b*t, 256, 2048)
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
+        # Split into history and future segments
         lc_his = image_embeddings[:, :horizon]  # (b, horizon, 256, 2048)
         x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
         lc_next = image_embeddings[:, horizon:]  # (b, horizon, 256, 2048)
-        a_next = actions[:, horizon:]  # (b, horizon, 256, 2048)
+        a_next = actions[:, horizon:]  # (b, horizon, 7)
 
+        # Build residual target and drift term
         res = jnp.concatenate([x_prior, lc_next], axis=1)
-        res = jnp.diff(res, axis=1) * 1
-        c_res = -1 * res  # Multiply by drift term to guide diffusion process
+        res = jnp.diff(res, axis=1)
+        c_res = -res  # Multiply by drift term to guide diffusion process
 
+        # Split RNG to avoid correlation between timestep sampling and noise
+        rng_t, rng_n = jax.random.split(rng)
         timestep = (
-            jax.random.uniform(rng, shape=(c_res.shape[0],), minval=0.0, maxval=1.0)
+            jax.random.uniform(rng_t, shape=(c_res.shape[0],), minval=0.0, maxval=1.0)
             * (1.0 - self._eps)
             + self._eps
         )
+        noise = jax.random.normal(rng_n, shape=c_res.shape)
 
-        noise = jax.random.normal(rng, shape=c_res.shape)
+        # Forward through diffusion transformer
+        x_noisy = self.add_noise(res, noise, timestep, c_res)
+        y_pred, y_pred_tmp = self._diffusion_transformer(x_noisy, lc_his, a_next, timestep)
 
-        x_noisy = self.add_noise(
-            res,
-            noise,
-            timestep,
-            c_res,
-        )
-
-        y_pred, y_pred_tmp = self._diffusion_transformer(
-            x_noisy, lc_his, a_next, timestep
-        )
-
+        # Losses
         loss = jnp.mean((y_pred - c_res) ** 2)
         aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
-
         return loss + aux_loss

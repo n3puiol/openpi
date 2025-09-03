@@ -195,8 +195,7 @@ class AdaLNModulator(nnx.Module):
         self.fc1 = nnx.Linear(dim, dim, rngs=rngs)
         self.fc2 = nnx.Linear(dim, 6 * dim, rngs=rngs)
         self.fc2.kernel.value = jnp.zeros_like(self.fc2.kernel.value)
-        if self.fc2.bias is not None:
-            self.fc2.bias.value = jnp.zeros_like(self.fc2.bias.value)
+    # Leave bias at its default initialization
 
     def __call__(self, t: jnp.ndarray):
         h = nnx.silu(self.fc1(t))
@@ -252,15 +251,17 @@ class DiTBlock(nnx.Module):
         # pre cross-attn with video features
         x = x + self.cross(x, v_fea, rngs=rngs)
         if block_type == "spatial":
-            x_bt = x.reshape(B, T, N, -1).transpose(0, 1, 2, 3).reshape(B * T, N, -1)
+            # transpose(0,1,2,3) is a no-op; avoid it for clarity
+            x_bt = x.reshape(B, T, N, -1).reshape(B * T, N, -1)
             t_bt = jnp.repeat(t, T, axis=0)  # [B*T, C]
             cond_bt = cond_fea.reshape(B * T, -1)  # [B*T, C]
             t_bt = t_bt + cond_bt
             s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bt)
             x_tmp = modulate_spatial(self.norm1(x_bt), s_msa, sc_msa)
             y = self.self_attn(x_tmp, rngs=rngs)
-            x_bt = x_bt + g_msa[:, None, :] * y
-            x_bt = x_bt + g_mlp[:, None, :] * self.mlp(
+            # Use residual scaling 1+g to avoid zeroed gradients at init
+            x_bt = x_bt + (1.0 + g_msa[:, None, :]) * y
+            x_bt = x_bt + (1.0 + g_mlp[:, None, :]) * self.mlp(
                 modulate_spatial(self.norm3(x_bt), s_mlp, sc_mlp)
             )
             x = x_bt.reshape(B, T, N, -1).reshape(B, T * N, -1)
@@ -272,8 +273,8 @@ class DiTBlock(nnx.Module):
             s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bn)
             x_tmp = modulate_temporal(self.norm1(x_bn), s_msa, sc_msa)
             y = self.self_attn(x_tmp, rngs=rngs)
-            x_bn = x_bn + g_msa * y
-            x_bn = x_bn + g_mlp * self.mlp(
+            x_bn = x_bn + (1.0 + g_msa) * y
+            x_bn = x_bn + (1.0 + g_mlp) * self.mlp(
                 modulate_temporal(self.norm3(x_bn), s_mlp, sc_mlp)
             )
             x = x_bn.reshape(B, N, T, -1).transpose(0, 2, 1, 3).reshape(B, T * N, -1)
@@ -291,8 +292,7 @@ class CompLayer(nnx.Module):
         self.out = nnx.Linear(hidden_size, out_channels, rngs=rngs)
         self.mod = nnx.Linear(hidden_size, 2 * hidden_size, rngs=rngs)
         self.mod.kernel.value = jnp.zeros_like(self.mod.kernel.value)
-        if self.mod.bias is not None:
-            self.mod.bias.value = jnp.zeros_like(self.mod.bias.value)
+    # Leave bias at its default initialization
 
     def __call__(
         self,
@@ -444,7 +444,7 @@ class VideoTransformer(nnx.Module):
         x = self.inp(x)
         B, T, N, C = x.shape
         x = x.reshape(B * N, T, C)
-        cls = jnp.tile(self.token.value, (B * N, 1, 1))
+        cls = jnp.broadcast_to(self.token.value, (B * N, 1, C))
         x = jnp.concatenate([cls, x], axis=1)
         for _, block in self.blocks.items():
             x = block(x, rngs=rngs)
@@ -482,8 +482,8 @@ class DiffusionTransformer(nnx.Module):
         self.time_encoder = TimestepEmbedder(dim, freq_dim=256, rngs=rngs)
         self.action_encoder = ActionEmbedder(dim, input_size=7, rngs=rngs)
         # Stacked DiT blocks (alternate spatial/temporal)
-        # self.blocks = [DiTBlock(dim, num_heads, rngs=rngs) for _ in range(n_layers)]
-        self.blocks = nnx.Dict({f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs) for i in range(n_layers)})
+        self.n_layers = n_layers
+        self.blocks = nnx.Dict({f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs) for i in range(self.n_layers)})
         # Output heads
         self.comp = CompLayer(
             dim, out_channels=in_channel, num_heads=num_heads, rngs=rngs
@@ -522,7 +522,7 @@ class DiffusionTransformer(nnx.Module):
         t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, C]
         act_fea = self.action_encoder(actions)  # [B, T, C]
         # DiT stack
-        for i, _ in enumerate(self.blocks):
+        for i in range(self.n_layers):
             mode = "spatial" if i % 2 == 0 else "temporal"
             x = self.blocks[f"block_{i}"](x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
             # x = block(x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
@@ -539,11 +539,11 @@ class DiffusionTransformer(nnx.Module):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
-    rngs = nnx.Rngs(params=key, dropout=key)
+    key_params, key_dropout = jax.random.split(key)
+    rngs = nnx.Rngs(params=key_params, dropout=key_dropout)
     B, T, N, Cin = 2, 4, 256, 4
     x_noisy = jax.random.normal(key, (B, T, N, Cin))
     lc_his = jax.random.normal(key, (B, T, N, Cin))
-    text_dummy = jnp.zeros((B, 77), dtype=jnp.int32)
     actions = jax.random.normal(key, (B, T, 7))
     t_scalar = jnp.ones((B,), dtype=jnp.float32) * 0.5
     model = DiffusionTransformer(
