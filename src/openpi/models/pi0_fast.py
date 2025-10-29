@@ -193,10 +193,6 @@ class Pi0FAST(_model.BaseModel):
             jnp.concatenate(input_mask, axis=1),
             jnp.concatenate(ar_mask, axis=1),
         )
-        
-    @override
-    def img_encode(self, images: at.Float[at.Array, "*b h w c"]) -> at.Float[at.Array, "*b s emb"]:
-        return self.PaliGemma.img(images, train=False)[0]
 
     @override
     def compute_loss(

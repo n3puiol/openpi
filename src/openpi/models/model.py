@@ -272,9 +272,6 @@ class BaseModel(nnx.Module, abc.ABC):
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
-    
-    @abc.abstractmethod
-    def img_encode(self, images: at.Float[at.Array, "*b h w c"]) -> at.Float[at.Array, "*b s emb"]: ...
 
 
 def restore_params(
