@@ -60,6 +60,9 @@ class Pi0FASTPredictor(Pi0FAST):
         time = timestep.reshape(c.shape[0], *((1,) * (len(c.shape) - 1)))
         x_noisy = x + c * time + time * noise
         return x_noisy
+    
+    def img_encode(self, images: at.Float[at.Array, "*b h w c"]) -> at.Float[at.Array, "*b s emb"]:
+        return self.PaliGemma.img(images, train=False)[0]
 
     @override
     def compute_loss(
@@ -107,4 +110,39 @@ class Pi0FASTPredictor(Pi0FAST):
         # Losses
         loss = jnp.mean((y_pred - c_res) ** 2)
         aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
-        return loss + aux_loss
+        return loss + 0.1 * aux_loss
+    
+    def forward(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah ac"]:
+        b, t, _ = actions.shape
+        # Preprocess observation and encode images
+        observation = _model.preprocess_observation(
+            rng, observation, train=train, image_keys=list(observation.images.keys())
+        )
+        image_embeddings = self.img_encode(observation.images[self._image_key])  # (b*t, 256, 2048)
+        _, s, p = image_embeddings.shape
+        image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
+
+        # Split into history and future segments
+        lc_his = image_embeddings
+        x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
+        a_next = actions  # (b, horizon, 7)
+
+        # Split RNG to avoid correlation between timestep sampling and noise
+        rng_t, rng_n = jax.random.split(rng)
+        timestep = (
+            jax.random.uniform(rng_t, shape=(x_prior.shape[0],), minval=0.0, maxval=1.0)
+            * (1.0 - self._eps)
+            + self._eps
+        )
+        x_noisy = jax.random.normal(rng_n, shape=lc_his.shape)
+
+        # Forward through diffusion transformer
+        y_pred, _ = self._diffusion_transformer(x_noisy, lc_his, a_next, timestep)
+        return y_pred

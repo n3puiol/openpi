@@ -252,7 +252,10 @@ class DiTBlock(nnx.Module):
         x = x + self.cross(x, v_fea, rngs=rngs)
         if block_type == "spatial":
             # transpose(0,1,2,3) is a no-op; avoid it for clarity
-            x_bt = x.reshape(B, T, N, -1).reshape(B * T, N, -1)
+            # print("x:", x.shape)
+            x_bta = x.reshape(B, T, N, -1).reshape(B * T, N, -1)
+            x_bt = x.reshape(B * T, N, -1)
+            print("is xbt same as xbta?", jnp.all(x_bt == x_bta))
             t_bt = jnp.repeat(t, T, axis=0)  # [B*T, C]
             cond_bt = cond_fea.reshape(B * T, -1)  # [B*T, C]
             t_bt = t_bt + cond_bt
@@ -499,7 +502,6 @@ class DiffusionTransformer(nnx.Module):
         actions: jnp.ndarray,
         time: jnp.ndarray,
         *,
-        precond: bool = False,
         rngs: Optional[nnx.Rngs] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
