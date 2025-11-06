@@ -1,4 +1,4 @@
-# save
+# Script to load original Pi0 params and combine them with predictor
 from openpi.training import config as _config
 import openpi.models.model as _model
 from openpi.shared import download
