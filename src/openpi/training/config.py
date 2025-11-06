@@ -16,6 +16,7 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
+import openpi.models.pi0_predictor as pi0_predictor
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.pi0_fast_predictor as pi0_fast_predictor
 import openpi.models.tokenizer as _tokenizer
@@ -114,7 +115,7 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI0_PREDICTOR:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -565,6 +566,9 @@ _CONFIGS = [
         # Also modify the DataConfig to use the new config you made for your dataset above.
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_base/assets",
+            ),
             base_config=DataConfig(
                 # This flag determines whether we load the prompt (i.e. the task instruction) from the
                 # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
@@ -578,6 +582,26 @@ _CONFIGS = [
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_libero_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero_predictor/assets",
+            ),
+            base_config=DataConfig(prompt_from_task=True, predictor=True, action_sequence_keys=("actions", "image")),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_libero/params"),
+        num_train_steps=2000,
+        freeze_filter=pi0_predictor.Pi0PredictorConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        batch_size=4,
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
@@ -654,7 +678,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True, predictor=True, action_sequence_keys=("actions", "image")),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_libero/params"),
-        num_train_steps=2,
+        num_train_steps=2000,
         freeze_filter=pi0_fast_predictor.Pi0FASTPredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),

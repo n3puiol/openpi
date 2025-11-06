@@ -27,6 +27,7 @@ class ModelType(enum.Enum):
     """Supported model types."""
 
     PI0 = "pi0"
+    PI0_PREDICTOR = "pi0_predictor"
     PI0_FAST = "pi0_fast"
     PI0_FAST_PREDICTOR = "pi0_fast_predictor"
 
