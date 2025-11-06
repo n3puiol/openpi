@@ -1,97 +1,73 @@
-from openpi.training import config as _config
+import argparse
 import jax
 import flax.nnx as nnx
-from scripts.train import _load_weights_and_validate
-from PIL import Image
+import flax.traverse_util as traverse_util
 import jax.numpy as jnp
-import openpi.transforms as _transforms
-import numpy as np
+
+from openpi.training import config as _config
 import openpi.training.data_loader as _data_loader
-import openpi.models.tokenizer as _tokenizer
-import openpi.training.sharding as sharding
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import openpi.shared.array_typing as at
+import openpi.training.weight_loaders as _weight_loaders
 from openpi.models import model as _model
-from openpi.models.pi0_fast import Pi0FAST, make_attn_mask
-import argparse
-from plot_reward import plot_values
+from openpi.models.pi0_predictor import Pi0Predictor, make_attn_mask
+
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from reward_estimator.plot_reward import plot_values
 
 
-def get_fused_embedding(model: Pi0FAST, observation: _model.Observation):
-    """
-    Computes a single, fused embedding vector from an observation.
+def _load_weights_and_validate(
+    loader: _weight_loaders.WeightLoader, params_shape: at.Params
+) -> at.Params:
+    """Loads and validates the weights. Returns a loaded subset of the weights."""
+    loaded_params = loader.load(params_shape)
+    # at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    This function performs the full forward pass to get the context-aware
-    latent representation from the PaliGemma model and then pools it into
-    a single vector.
-
-    Args:
-        model: An instance of your Pi0FAST model.
-        observation: The input observation containing images and a prompt.
-
-    Returns:
-        A single JAX array representing the fused embedding.
-    """
-    # 1. Get the concatenated sequence of image and text token embeddings
-    # This combines the outputs of the image encoder and the text embedder.
-    input_token_embeddings, input_mask, ar_mask = model.embed_inputs(observation)
-
-    # 2. Create the attention mask that governs the fusion process
-    attn_mask = make_attn_mask(input_mask, ar_mask)
-
-    # 3. Pass the full sequence through the LLM to perform fusion
-    # We call the LLM to get the final hidden states before the vocabulary projection.
-    # This is the 'pre_logits' output from the transformer.
-    fused_sequence_embeddings, _, _ = model.PaliGemma.llm(
-        embedded_prefix=input_token_embeddings,
-        mask=attn_mask,
-        return_prelogits=True,
+    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    return traverse_util.unflatten_dict(
+        {
+            k: v
+            for k, v in traverse_util.flatten_dict(loaded_params).items()
+            if not isinstance(v, jax.ShapeDtypeStruct)
+        }
     )
 
-    # 4. Pool the fused sequence into a single representative vector
-    # We use global average pooling across the sequence length.
-    # We apply the input_mask to only average over valid (non-padding) tokens.
 
-    # Expand input_mask to be broadcastable with the embeddings
-    mask_expanded = jnp.expand_dims(input_mask, axis=-1)
-
-    # Sum the embeddings of valid tokens
-    summed_embeddings = jnp.sum(fused_sequence_embeddings * mask_expanded, axis=1)
-
-    # Count the number of valid tokens
-    num_valid_tokens = jnp.sum(input_mask, axis=1, keepdims=True)
-
-    # Compute the mean
-    pooled_fused_embedding = summed_embeddings / jnp.maximum(num_valid_tokens, 1)
-
-    return pooled_fused_embedding
+def get_fused_embedding(model: Pi0Predictor, observation: _model.Observation, rng):
+    image_embeddings = model.embed_inputs(observation, train=False, rng=rng)
+    fused_embeddings = model.get_fused_embedding(image_embeddings, observation)
+    return fused_embeddings
 
 
-def compute_goal_embedding(model: Pi0FAST, dataset, episode_data_index):
+def compute_goal_embedding(model: Pi0Predictor, dataset, episode_data_index):
     print("Computing goal embedding...")
     end_episodes = episode_data_index["to"].cpu().numpy()
     num_episodes = len(end_episodes)
     goal_embeddings = []
+    rng = jax.random.key(0)
     for i in range(num_episodes):
         print(f"Processing episode {i+1}/{num_episodes}", end="\r")
         index = int(end_episodes[i]) - 1
-        observation = get_observation(dataset, index)
-        goal_embedding = get_fused_embedding(model, observation)[0]
+        observation = get_observation(dataset, index, model._image_key)
+        rng, sub_rng = jax.random.split(rng)
+        goal_embedding = get_fused_embedding(model, observation, sub_rng)[0]
         goal_embeddings.append(goal_embedding)
     goal_embeddings = jnp.stack(goal_embeddings, axis=0)
     goal_embeddings = jnp.mean(goal_embeddings, axis=0)
     return goal_embeddings
 
 
-def compute_baseline_embedding(model: Pi0FAST, dataset, episode_data_index):
+def compute_baseline_embedding(model: Pi0Predictor, dataset, episode_data_index):
     print("Computing baseline embedding...")
     start_episodes = episode_data_index["from"].cpu().numpy()
     num_episodes = len(start_episodes)
     baseline_embeddings = []
+    rng = jax.random.key(0)
     for i in range(num_episodes):
         print(f"Processing episode {i+1}/{num_episodes}", end="\r")
         index = int(start_episodes[i])
-        observation = get_observation(dataset, index)
-        baseline_embedding = get_fused_embedding(model, observation)[0]
+        observation = get_observation(dataset, index, model._image_key)
+        rng, sub_rng = jax.random.split(rng)
+        baseline_embedding = get_fused_embedding(model, observation, sub_rng)[0]
         baseline_embeddings.append(baseline_embedding)
     baseline_embeddings = jnp.stack(baseline_embeddings, axis=0)
     baseline_embeddings = jnp.mean(baseline_embeddings, axis=0)
@@ -111,7 +87,7 @@ def distance_similarity(emb1, emb2):
     return jnp.linalg.norm(emb1 - emb2)
 
 
-def load_model(config) -> Pi0FAST:
+def load_model(config) -> Pi0Predictor:
     rng = jax.random.key(42)  # or any seed
     model_rng, _ = jax.random.split(rng)
 
@@ -142,15 +118,15 @@ def get_episode_data_index(config):
     return dataset.episode_data_index
 
 
-def get_observation(dataset, index):
+def get_observation(dataset, index, image_key):
     element = dataset[index]
-    observation = convert_to_observation(element["observation"])
-    return observation
-
-def convert_to_observation(observation_dict):
     batched_element = jax.tree.map(
-        lambda x: jnp.expand_dims(jnp.array(x), axis=0), observation_dict
+        lambda x: jnp.expand_dims(jnp.array(x), axis=0), element
     )
+    horizon = batched_element["image"][image_key].shape[1] // 2
+    batched_element["image"][image_key] = batched_element["image"][image_key][
+        :, horizon : horizon + 1, :, :, :
+    ]
     observation = _model.Observation.from_dict(batched_element)
     return observation
 
@@ -213,17 +189,26 @@ def compute(config_path: str):
     dataset = get_dataset(config)
     episode_data_index = get_episode_data_index(config)
     baseline_embedding = compute_baseline_embedding(model, dataset, episode_data_index)
-    save_embedding(baseline_embedding, "baseline_embedding_1.npy")
+    save_embedding(
+        baseline_embedding,
+        f"reward_estimation_embeddings/baseline_embedding_${config_path}.npy",
+    )
     goal_embedding = compute_goal_embedding(model, dataset, episode_data_index)
-    save_embedding(goal_embedding, "goal_embedding_1.npy")
+    save_embedding(
+        goal_embedding, f"reward_estimation_embeddings/goal_embedding_{config_path}.npy"
+    )
 
 
 def evaluate(config_path: str, episode: int, skip: int = 20):
     config = _config.get_config(config_path)
     episode_data_index = get_episode_data_index(config)
-    goal_embedding = jnp.load("goal_embedding_1.npy")
+    goal_embedding = jnp.load(
+        "/scratch/s5649552/openpi/src/reward_estimator/goal_embedding_1.npy"
+    )
     print(f"Loaded goal embedding shape: {goal_embedding.shape}")
-    baseline_embedding = jnp.load("baseline_embedding_1.npy")
+    baseline_embedding = jnp.load(
+        "/scratch/s5649552/openpi/src/reward_estimator/baseline_embedding_1.npy"
+    )
     print(f"Loaded baseline embedding shape: {baseline_embedding.shape}")
 
     dataset = get_dataset(config)
@@ -232,9 +217,11 @@ def evaluate(config_path: str, episode: int, skip: int = 20):
     ep_end = episode_data_index["to"][episode].cpu().numpy()
     print(f"Evaluating episode {episode}, steps {ep_start} to {ep_end}")
     rewards = []
+    rng = jax.random.key(0)
     for i in range(ep_start, ep_end, skip):
-        observation = get_observation(dataset, i)
-        embedding = get_fused_embedding(model, observation)[0]
+        observation = get_observation(dataset, i, model._image_key)
+        rng, sub_rng = jax.random.split(rng)
+        embedding = get_fused_embedding(model, observation, sub_rng)[0]
         reward = compute_regularized_reward(
             state_embedding=embedding,
             goal_embedding=goal_embedding,
@@ -252,7 +239,7 @@ if __name__ == "__main__":
         "--config",
         "-c",
         type=str,
-        default="pi0_fast_libero",
+        default="pi0_libero_predictor",
         help="Path or name of the config to load",
     )
     parser.add_argument(

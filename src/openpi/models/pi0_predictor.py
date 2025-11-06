@@ -64,10 +64,18 @@ class Pi0Predictor(Pi0):
         x_noisy = x + c * time + time * noise
         return x_noisy
 
-    def img_encode(
-        self, images: at.Float[at.Array, "*b h w c"]
+    def embed_inputs(
+        self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
     ) -> at.Float[at.Array, "*b s emb"]:
-        return self.PaliGemma.img(images, train=False)[0]
+        observation = _model.preprocess_observation(
+            rng, observation, train=train, image_keys=list(observation.images.keys())
+        )
+        return self.PaliGemma.img(observation.images[self._image_key], train=False)[0]
+
+    # def img_encode(
+    #     self, images: at.Float[at.Array, "*b h w c"]
+    # ) -> at.Float[at.Array, "*b s emb"]:
+    #     return self.PaliGemma.img(images, train=False)[0]
 
     @override
     def compute_loss(
@@ -81,12 +89,13 @@ class Pi0Predictor(Pi0):
         b, t, _ = actions.shape
         horizon = t // 2
         # Preprocess observation and encode images
-        observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
-        )
-        image_embeddings = self.img_encode(
-            observation.images[self._image_key]
-        )  # (b*t, 256, 2048)
+        # observation = _model.preprocess_observation(
+        #     rng, observation, train=train, image_keys=list(observation.images.keys())
+        # )
+        # image_embeddings = self.img_encode(
+        #     observation.images[self._image_key]
+        # )  # (b*t, 256, 2048)
+        image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
@@ -219,54 +228,47 @@ class Pi0Predictor(Pi0):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
 
-    def get_fused_embedding(self, image_token_embeddings, obs, name):
-        fused_embeddings = []
-
-        for i in range(image_token_embeddings.shape[1]):
-            emb = image_token_embeddings[:, i, :]  # (1, 256, 2048)
-            input_mask = []
-            ar_mask = []
-            token_embeddings = []
-            token_embeddings.append(emb)
-            input_mask.append(
-                einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=emb.shape[1],
-                )
+    def get_fused_embedding(self, image_tokens, obs):
+        input_mask = []
+        ar_mask = []
+        tokens = []
+        
+        tokens.append(image_tokens)
+        input_mask.append(
+            einops.repeat(
+                obs.image_masks[self._image_key],
+                "b -> b s",
+                s=image_tokens.shape[1],
             )
-            ar_mask.append(0 * input_mask[-1])
+        )
+        ar_mask += [False] * image_tokens.shape[1]
+        
+        tokenized_inputs = self.PaliGemma.llm(
+            obs.tokenized_prompt, method="embed"
+        )
+        tokens.append(tokenized_inputs)
+        input_mask.append(obs.tokenized_prompt_mask)
+        ar_mask += [False] * tokenized_inputs.shape[1]
 
-            tokenized_inputs_embeddings = self.PaliGemma.llm(
-                obs.tokenized_prompt, embed_only=True
-            )
+        tokens = jnp.concatenate(tokens, axis=1)
+        input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask = jnp.array(ar_mask)
 
-            token_embeddings.append(tokenized_inputs_embeddings)
-            input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask.append(obs.token_ar_mask)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
 
-            input_token_embeddings = jnp.concatenate(token_embeddings, axis=1)
-            input_mask = jnp.concatenate(input_mask, axis=1)
-            ar_mask = jnp.concatenate(ar_mask, axis=1)
+        (fused_sequence_embeddings, _), _ = self.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
 
-            attn_mask = make_attn_mask(input_mask, ar_mask)
+        mask_expanded = jnp.expand_dims(input_mask, axis=-1)
+        summed_embeddings = jnp.sum(
+            fused_sequence_embeddings * mask_expanded, axis=1
+        )
+        num_valid_tokens = jnp.sum(input_mask, axis=1, keepdims=True)
+        pooled_fused_embedding = summed_embeddings / jnp.maximum(
+            num_valid_tokens, 1
+        )
+        return pooled_fused_embedding
 
-            fused_sequence_embeddings, _, _ = self.PaliGemma.llm(
-                embedded_prefix=input_token_embeddings,
-                mask=attn_mask,
-                return_prelogits=True,
-            )
-            mask_expanded = jnp.expand_dims(input_mask, axis=-1)
-            summed_embeddings = jnp.sum(
-                fused_sequence_embeddings * mask_expanded, axis=1
-            )
-            num_valid_tokens = jnp.sum(input_mask, axis=1, keepdims=True)
-            pooled_fused_embedding = summed_embeddings / jnp.maximum(
-                num_valid_tokens, 1
-            )
-            fused_embeddings.append(pooled_fused_embedding)
-
-        return fused_embeddings
 
     def predict_future(
         self,
@@ -278,12 +280,13 @@ class Pi0Predictor(Pi0):
     ):
         b, t, _ = actions.shape
         # Preprocess observation and encode images
-        observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
-        )
-        image_embeddings = self.img_encode(
-            observation.images[self._image_key]
-        )  # (b*t, 256, 2048)
+        # observation = _model.preprocess_observation(
+        #     rng, observation, train=train, image_keys=list(observation.images.keys())
+        # )
+        # image_embeddings = self.img_encode(
+        #     observation.images[self._image_key]
+        # )  # (b*t, 256, 2048)
+        image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
@@ -304,12 +307,8 @@ class Pi0Predictor(Pi0):
         # Forward through diffusion transformer
         y_pred, _ = self._diffusion_transformer(x_noisy, lc_his, a_next, timestep)
 
-        past_fused_embedding = self.get_fused_embedding(
-            lc_his, observation, self._image_key
-        )
+        past_fused_embedding = self.get_fused_embedding(lc_his, observation)
 
-        future_fused_embedding = self.get_fused_embedding(
-            y_pred, observation, self._image_key
-        )
+        future_fused_embedding = self.get_fused_embedding(y_pred, observation)
 
         return past_fused_embedding, future_fused_embedding
