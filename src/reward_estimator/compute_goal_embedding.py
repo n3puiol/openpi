@@ -191,7 +191,7 @@ def compute(config_path: str):
     baseline_embedding = compute_baseline_embedding(model, dataset, episode_data_index)
     save_embedding(
         baseline_embedding,
-        f"reward_estimation_embeddings/baseline_embedding_${config_path}.npy",
+        f"reward_estimation_embeddings/baseline_embedding_{config_path}.npy",
     )
     goal_embedding = compute_goal_embedding(model, dataset, episode_data_index)
     save_embedding(
@@ -202,14 +202,12 @@ def compute(config_path: str):
 def evaluate(config_path: str, episode: int, skip: int = 20):
     config = _config.get_config(config_path)
     episode_data_index = get_episode_data_index(config)
-    goal_embedding = jnp.load(
-        "/scratch/s5649552/openpi/src/reward_estimator/goal_embedding_1.npy"
-    )
-    print(f"Loaded goal embedding shape: {goal_embedding.shape}")
     baseline_embedding = jnp.load(
-        "/scratch/s5649552/openpi/src/reward_estimator/baseline_embedding_1.npy"
+        f"reward_estimation_embeddings/baseline_embedding_{config_path}.npy"
     )
     print(f"Loaded baseline embedding shape: {baseline_embedding.shape}")
+    goal_embedding = jnp.load(f"reward_estimation_embeddings/goal_embedding_{config_path}.npy")
+    print(f"Loaded goal embedding shape: {goal_embedding.shape}")
 
     dataset = get_dataset(config)
     model = load_model(config)

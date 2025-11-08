@@ -46,6 +46,7 @@ def plot_values(ep_start, ep_end, skip, rewards, episode):
     plt.savefig(
         f"regularized_reward_plots/smoothed_regularized_reward_plot_{episode}.png"
     )
+    print(f"Saved plot to regularized_reward_plots/smoothed_regularized_reward_plot_{episode}.png")
 
 
 if __name__ == "__main__":
