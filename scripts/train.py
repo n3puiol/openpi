@@ -191,6 +191,28 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def val_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """Validation step that only computes loss without updating parameters."""
+    # Use EMA params if available, otherwise use regular params
+    params = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, params)
+    model.eval()
+
+    val_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+    
+    chunked_loss = model.compute_loss(val_rng, observation, actions, train=False)
+    loss = jnp.mean(chunked_loss)
+    
+    return {"val_loss": loss}
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -203,7 +225,7 @@ def main(config: _config.TrainConfig):
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)
-    train_rng, init_rng = jax.random.split(rng)
+    train_rng, val_rng, init_rng = jax.random.split(rng, 3)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
@@ -221,8 +243,20 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
+        train=True,
+        val_split=config.val_split,
     )
     data_iter = iter(data_loader)
+    
+    val_data_loader = _data_loader.create_data_loader(
+        config,
+        sharding=data_sharding,
+        shuffle=False,
+        train=False,
+        val_split=config.val_split,
+        num_batches=config.max_val_batches,
+    )
+    
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
@@ -246,6 +280,12 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    
+    pval_step = jax.jit(
+        functools.partial(val_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -267,6 +307,20 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+        
+        if step % config.val_interval == 0 and step > start_step:
+            val_infos = []
+            for val_batch in val_data_loader:
+                with sharding.set_mesh(mesh):
+                    val_info = pval_step(val_rng, train_state, val_batch)
+                val_infos.append(val_info)
+            
+            stacked_val_infos = common_utils.stack_forest(val_infos)
+            reduced_val_info = jax.device_get(jax.tree.map(jnp.mean, stacked_val_infos))
+            val_info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val_info.items())
+            pbar.write(f"Step {step} (validation): {val_info_str}")
+            wandb.log(reduced_val_info, step=step)    
+        
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:

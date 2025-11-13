@@ -461,6 +461,10 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+    
+    val_split: float = 0.1  # Fraction of data to use for validation
+    val_interval: int = 1000  # Run validation every N steps
+    max_val_batches: int | None = 100  # Limit validation batches
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -585,8 +589,9 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_libero_predictor",
+        project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7, action_horizon=20, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -596,7 +601,9 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True, predictor=True, action_sequence_keys=("actions", "image")),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_libero/params"),
-        num_train_steps=2000,
+        num_train_steps=200_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=3e-4, decay_steps=200_000, decay_lr=1e-6),
+        optimizer=_optimizer.AdamW(b1=0.9, b2=0.99, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0),
         freeze_filter=pi0_predictor.Pi0PredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),

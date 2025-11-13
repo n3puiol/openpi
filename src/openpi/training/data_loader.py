@@ -140,6 +140,9 @@ def create_torch_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
     model_config: _model.BaseModelConfig,
+    *,
+    train: bool = True,
+    val_split: float = 0.1,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -161,6 +164,16 @@ def create_torch_dataset(
             for key in data_config.action_sequence_keys
         },
     )
+    
+        # Split dataset into train and validation
+    total_size = len(dataset)
+    val_size = int(total_size * val_split)
+    train_size = total_size - val_size
+    
+    if train:
+        dataset = torch.utils.data.Subset(dataset, range(train_size))
+    else:
+        dataset = torch.utils.data.Subset(dataset, range(train_size, total_size))
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(
@@ -251,6 +264,8 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
+    train: bool = True,
+    val_split: float = 0.1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]] | dict:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -276,6 +291,8 @@ def create_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
+            train=train,
+        val_split=val_split,
     )
 
 
@@ -291,6 +308,8 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    train: bool = True,
+    val_split: float = 0.1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -309,7 +328,9 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(
+        data_config, action_horizon, model_config, train=train, val_split=val_split
+    )
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
