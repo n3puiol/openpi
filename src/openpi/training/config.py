@@ -591,7 +591,7 @@ _CONFIGS = [
         name="pi0_libero_predictor",
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
-            action_dim=7, action_horizon=20, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7, action_horizon=30, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -607,7 +607,7 @@ _CONFIGS = [
         freeze_filter=pi0_predictor.Pi0PredictorConfig(
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
-        batch_size=4,
+        batch_size=1,
         ema_decay=None,
     ),
     TrainConfig(
