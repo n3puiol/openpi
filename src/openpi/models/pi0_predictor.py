@@ -25,7 +25,7 @@ class Pi0PredictorConfig(Pi0Config):
     eps: float = 1e-5
     image_key: str = "base_0_rgb"
     rollout_factor: float = 1.0
-    training_steps: int = 6 # number of steps for training (teacher forcing (2) + rollout steps (steps - 2))
+    horizon: int = 5
     
     # Reward estimation embeddings
     baseline_embedding_path: str = (
@@ -61,7 +61,7 @@ class Pi0Predictor(Pi0):
         self._eps = config.eps
         self._image_key = config.image_key
         self._rollout_factor = config.rollout_factor
-        self._training_steps = config.training_steps
+        self._horizon = config.horizon
         # self._baseline_embedding_path = jnp.load(config.baseline_embedding_path)
         # self._goal_embedding_path = jnp.load(config.goal_embedding_path)
         # self._alpha = config.alpha
@@ -188,8 +188,14 @@ class Pi0Predictor(Pi0):
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         b, t, _ = actions.shape
-        steps = self._training_steps
-        horizon = t // steps
+        horizon = self._horizon
+        rollout_steps = b // horizon
+        steps = t // horizon
+        print("b:", b)
+        print("t:", t)
+        print("horizon:", horizon)
+        print("rollout_steps:", rollout_steps)
+        print("steps:", steps)
         
         image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
         _, s, p = image_embeddings.shape
@@ -227,18 +233,25 @@ class Pi0Predictor(Pi0):
             return total_loss, y_pred
 
         # Teacher forcing loss
-        lc_his = image_embeddings[:, :horizon]
-        lc_next = image_embeddings[:, horizon:horizon*2]
-        a_next = actions[:, horizon:horizon*2]
+        lc_his = image_embeddings[:, :steps]
+        lc_next = image_embeddings[:, steps:steps*2]
+        a_next = actions[:, steps:steps*2]
+        print("lc_his shape:", lc_his.shape)
+        print("lc_next shape:", lc_next.shape)
+        print("a_next shape:", a_next.shape)
         
         teacher_forcing_loss, y_pred = compute_step_loss(lc_his, lc_next, a_next, rng)
         
         # Rollout loss
         rollout_loss = 0.0
-        for i in range(2, steps):
+        for i in range(2, rollout_steps):
+            print(f"Rollout step {i}")
             lc_his = y_pred
-            lc_next = image_embeddings[:, horizon*i:horizon*(i+1)]
-            a_next = actions[:, horizon*i:horizon*(i+1)]
+            lc_next = image_embeddings[:, steps*i:steps*(i+1)]
+            a_next = actions[:, steps*i:steps*(i+1)]
+            print("lc_his shape:", lc_his.shape)
+            print("lc_next shape:", lc_next.shape)
+            print("a_next shape:", a_next.shape)
             
             step_loss, y_pred = compute_step_loss(lc_his, lc_next, a_next, rng)
             rollout_loss += step_loss
