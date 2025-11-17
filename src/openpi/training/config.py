@@ -680,20 +680,19 @@ _CONFIGS = [
         ),
         num_train_steps=20_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500, peak_lr=3e-5, decay_steps=20_000, decay_lr=1e-6
+            warmup_steps=2000, peak_lr=3e-5, decay_steps=20_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.99, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig(
             action_dim=7,
-            action_horizon=10,
+            action_horizon=30,
             max_token_len=180,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
-            rollout_factor=0.5,
         ).get_freeze_filter(),
-        batch_size=4,
+        batch_size=2,
         ema_decay=None,
     ),
     TrainConfig(

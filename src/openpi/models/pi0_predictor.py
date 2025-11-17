@@ -88,7 +88,7 @@ class Pi0Predictor(Pi0):
             rng, observation, train=train, image_keys=list(observation.images.keys())
         )
         return self.PaliGemma.img(observation.images[self._image_key], train=False)[0]
-    
+
     # @override
     # def compute_loss(
     #     self,
@@ -108,7 +108,7 @@ class Pi0Predictor(Pi0):
     #     image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
     #     # teacher forcing loss
-        
+
     #     # Split into history and future segments
     #     lc_his = image_embeddings[:, :horizon]  # (b, horizon, 256, 2048)
     #     print("lc_his shape:", lc_his.shape)
@@ -136,12 +136,12 @@ class Pi0Predictor(Pi0):
     #         x_noisy, lc_his, a_next, timestep
     #     )
     #     print("y_pred shape:", y_pred.shape)
-        
+
     #     # Losses
     #     loss = jnp.mean((y_pred - c_res) ** 2)
     #     aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
     #     teacher_forcing_loss = jnp.mean(loss + 0.1 * aux_loss)
-        
+
     #     # rollout loss
     #     rollout_loss = 0.0
     #     for i in range(2, steps):
@@ -149,7 +149,7 @@ class Pi0Predictor(Pi0):
     #         x_prior = lc_his[:, -1:, :]
     #         lc_next = image_embeddings[:, horizon*i:horizon*(i+1)]
     #         a_next = actions[:, horizon*i:horizon*(i+1)]
-            
+
     #         # Build residual target and drift term
     #         res = jnp.concatenate([x_prior, lc_next], axis=1)
     #         res = jnp.diff(res, axis=1)
@@ -169,15 +169,15 @@ class Pi0Predictor(Pi0):
     #         y_pred, y_pred_tmp = self._diffusion_transformer(
     #             x_noisy, lc_his, a_next, timestep
     #         )
-            
+
     #         # Losses
     #         loss = jnp.mean((y_pred - c_res) ** 2)
     #         aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
     #         rollout_loss += jnp.mean(loss + 0.1 * aux_loss)
     #     rollout_loss = rollout_loss / (steps - 2)
-        
+
     #     return teacher_forcing_loss + rollout_loss
-    
+
     @override
     def compute_loss(
         self,
@@ -189,14 +189,8 @@ class Pi0Predictor(Pi0):
     ) -> at.Float[at.Array, "*b ah"]:
         b, t, _ = actions.shape
         horizon = self._horizon
-        rollout_steps = b // horizon
-        steps = t // horizon
-        print("b:", b)
-        print("t:", t)
-        print("horizon:", horizon)
-        print("rollout_steps:", rollout_steps)
-        print("steps:", steps)
-        
+        rollout_steps = t // horizon
+
         image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
@@ -204,12 +198,12 @@ class Pi0Predictor(Pi0):
         def compute_step_loss(lc_his, lc_next, a_next, rng):
             """Compute loss for a single prediction step."""
             x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
-            
+
             # Build residual target and drift term
             res = jnp.concatenate([x_prior, lc_next], axis=1)
             res = jnp.diff(res, axis=1)
             c_res = -res
-            
+
             # Split RNG for timestep and noise
             rng_t, rng_n = jax.random.split(rng)
             timestep = (
@@ -218,46 +212,45 @@ class Pi0Predictor(Pi0):
                 + self._eps
             )
             noise = jax.random.normal(rng_n, shape=c_res.shape)
-            
+
             # Forward through diffusion transformer
             x_noisy = self.add_noise(res, noise, timestep, c_res)
             y_pred, y_pred_tmp = self._diffusion_transformer(
                 x_noisy, lc_his, a_next, timestep
             )
-            
+
             # Compute losses
             loss = jnp.mean((y_pred - c_res) ** 2)
             aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
             total_loss = loss + 0.1 * aux_loss
-            
-            return total_loss, y_pred
+
+            predicted_embeddings = lc_his[:, -1:, :] + y_pred
+
+            return total_loss, predicted_embeddings
 
         # Teacher forcing loss
-        lc_his = image_embeddings[:, :steps]
-        lc_next = image_embeddings[:, steps:steps*2]
-        a_next = actions[:, steps:steps*2]
-        print("lc_his shape:", lc_his.shape)
-        print("lc_next shape:", lc_next.shape)
-        print("a_next shape:", a_next.shape)
-        
-        teacher_forcing_loss, y_pred = compute_step_loss(lc_his, lc_next, a_next, rng)
-        
+        lc_his = image_embeddings[:, :horizon]
+        lc_next = image_embeddings[:, horizon:horizon*2]
+        a_next = actions[:, horizon:horizon*2]
+
+        teacher_forcing_loss, predicted_embeddings = compute_step_loss(
+            lc_his, lc_next, a_next, rng
+        )
+
         # Rollout loss
         rollout_loss = 0.0
         for i in range(2, rollout_steps):
-            print(f"Rollout step {i}")
-            lc_his = y_pred
-            lc_next = image_embeddings[:, steps*i:steps*(i+1)]
-            a_next = actions[:, steps*i:steps*(i+1)]
-            print("lc_his shape:", lc_his.shape)
-            print("lc_next shape:", lc_next.shape)
-            print("a_next shape:", a_next.shape)
-            
-            step_loss, y_pred = compute_step_loss(lc_his, lc_next, a_next, rng)
+            lc_his = predicted_embeddings
+            lc_next = image_embeddings[:, horizon*i:horizon*(i+1)]
+            a_next = actions[:, horizon*i:horizon*(i+1)]
+
+            step_loss, predicted_embeddings = compute_step_loss(
+                lc_his, lc_next, a_next, rng
+            )
             rollout_loss += step_loss
-        
-        rollout_loss = rollout_loss / (steps - 2)
-        
+
+        rollout_loss = rollout_loss / (rollout_steps - 2)
+
         return teacher_forcing_loss + self._rollout_factor * rollout_loss
 
     # @override
@@ -431,42 +424,40 @@ class Pi0Predictor(Pi0):
 
         return past_fused_embedding, future_fused_embedding
 
-    def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
-        s = state_embedding
-        g = self._goal_embedding_path
-        b = self._baseline_embedding_path
+    # def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
+    #     s = state_embedding
+    #     g = self._goal_embedding_path
+    #     b = self._baseline_embedding_path
 
-        direction_vector = g - b
-        direction_vector_norm_sq = jnp.sum(direction_vector**2)
+    #     direction_vector = g - b
+    #     direction_vector_norm_sq = jnp.sum(direction_vector**2)
 
-        s_minus_b = s - b
-        projection_scalar = jnp.dot(s_minus_b, direction_vector) / jnp.maximum(
-            direction_vector_norm_sq, 1e-6
-        )
-        projected_s = b + projection_scalar * direction_vector
+    #     s_minus_b = s - b
+    #     projection_scalar = jnp.dot(s_minus_b, direction_vector) / jnp.maximum(
+    #         direction_vector_norm_sq, 1e-6
+    #     )
+    #     projected_s = b + projection_scalar * direction_vector
 
-        blended_embedding = (1 - self._alpha) * s + self._alpha * projected_s
+    #     blended_embedding = (1 - self._alpha) * s + self._alpha * projected_s
 
-        reward = 1.0 - 0.5 * jnp.sum((blended_embedding - g) ** 2)
-        return reward
+    #     reward = 1.0 - 0.5 * jnp.sum((blended_embedding - g) ** 2)
+    #     return reward
 
-    def reward_model(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        actions: _model.Actions,
-    ):
-        # TODO 1: get reward from recent past reward with sliding window
-        # TODO 2: store reward history
-        # TODO 3: slide window on predicted future embeddings and get future reward
-        # TODO 4: normalize reward?
-        # TODO 5: determine if reward is increasing or decreasing
-        past_embedding, future_embedding = self.predict_future(
-            rng, observation, actions, train=False
-        )
-        past_reward = self.compute_regularized_reward(past_embedding)
-        future_reward = self.compute_regularized_reward(future_embedding)
-        
-        return
+    # def reward_model(
+    #     self,
+    #     rng: at.KeyArrayLike,
+    #     observation: _model.Observation,
+    #     actions: _model.Actions,
+    # ):
+    #     # TODO 1: get reward from recent past reward with sliding window
+    #     # TODO 2: store reward history
+    #     # TODO 3: slide window on predicted future embeddings and get future reward
+    #     # TODO 4: normalize reward?
+    #     # TODO 5: determine if reward is increasing or decreasing
+    #     past_embedding, future_embedding = self.predict_future(
+    #         rng, observation, actions, train=False
+    #     )
+    #     past_reward = self.compute_regularized_reward(past_embedding)
+    #     future_reward = self.compute_regularized_reward(future_embedding)
 
-        
+    #     return
