@@ -265,17 +265,35 @@ class Pi0Predictor(Pi0):
                 emb = self.get_fused_embedding(embedding_tokens, obs_fixed)
                 return self.compute_regularized_reward(state_embedding=emb)
 
-            # batch_reward_fn = jax.vmap(get_reward_for_timestep)
+            # def batch_reward_fn(embeddings, obs_fixed):
+            #     rewards = []
+            #     for i in range(embeddings.shape[1]):
+            #         emb = embeddings[:, i, :, :] # [B, S, Emb]
+            #         fused_emb = self.get_fused_embedding(emb, obs_fixed) # [B, Emb]
+            #         reward = self.compute_regularized_reward(state_embedding=fused_emb) # [B,]
+            #         rewards.append(reward)
+            #     return jnp.stack(rewards, axis=0)
+            # batch_reward_fn = jax.vmap(
+            #     lambda emb: get_reward_for_timestep(emb, observation),
+            #     in_axes=1,  # Map over horizon dimension
+            #     out_axes=0   # Stack results along first dimension
+            # )
+            # gt_rewards = batch_reward_fn(lc_next[:, -1:, :, :])
+            # pred_rewards = batch_reward_fn(predicted_embeddings[:, -1:, :, :])
+            gt_reward = get_reward_for_timestep(lc_next[:, -1, :, :], observation)
+            pred_reward = get_reward_for_timestep(predicted_embeddings[:, -1, :, :], observation)
 
+            # lc_next: [B, Horizon, S, Emb]
+            # predicted_embeddings: [B, Horizon, S, Emb]
             # gt_rewards = batch_reward_fn(lc_next, observation)
             # pred_rewards = batch_reward_fn(predicted_embeddings, observation)
 
             # Losses
             loss = jnp.mean((y_pred - c_res) ** 2)
             aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
-            # reward_loss = jnp.mean((pred_rewards - gt_rewards) ** 2)
+            reward_loss = jnp.mean((pred_reward - gt_reward) ** 2)
 
-            return loss + 0.1 * aux_loss
+            return loss + 0.1 * aux_loss + 0.2 * reward_loss
 
         return compute_step_loss(lc_his, lc_next, a_future, rng)
 

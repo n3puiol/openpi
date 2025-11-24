@@ -37,6 +37,7 @@ class Policy(BasePolicy):
         self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        self._model = model
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
