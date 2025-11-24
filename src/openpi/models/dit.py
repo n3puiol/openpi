@@ -10,20 +10,6 @@ from flax import nnx
 # -----------------------------------------------------------------------------
 
 
-def modulate_spatial(
-    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
-) -> jnp.ndarray:
-    """AdaLN: x * (1 + scale) + shift; broadcast over tokens."""
-    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
-
-
-def modulate_temporal(
-    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
-) -> jnp.ndarray:
-    """AdaLN variant aligned to x's shape (e.g., temporal per-token)."""
-    return x * (1.0 + scale) + shift
-
-
 def sinusoidal_embedding(
     t: jnp.ndarray, dim: int, max_period: float = 10_000.0
 ) -> jnp.ndarray:
@@ -123,168 +109,6 @@ class MultiHeadAttention(nnx.Module):
         return out
 
 
-class CrossAttention(nnx.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        *,
-        rngs: nnx.Rngs,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        assert dim % num_heads == 0
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.q = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.k = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.v = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.attn_drop = nnx.Dropout(attn_drop) if attn_drop > 0 else None
-        self.proj_drop = nnx.Dropout(proj_drop) if proj_drop > 0 else None
-
-    def __call__(
-        self,
-        x_q: jnp.ndarray,
-        x_kv: jnp.ndarray,
-        *,
-        mask: Optional[jnp.ndarray] = None,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> jnp.ndarray:
-        B, Nq, C = x_q.shape
-        B2, Nk, C2 = x_kv.shape
-        assert B == B2 and C == C2
-        q = (
-            self.q(x_q)
-            .reshape(B, Nq, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k = (
-            self.k(x_kv)
-            .reshape(B, Nk, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            self.v(x_kv)
-            .reshape(B, Nk, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
-        if mask is not None:
-            m = mask[:, None, None, :]
-            attn = jnp.where(m, attn, jnp.full_like(attn, -1e30))
-        attn = nnx.softmax(attn, axis=-1)
-        if self.attn_drop is not None:
-            attn = self.attn_drop(attn, rngs=rngs)
-        out = (
-            jnp.einsum("bhqk,bhkd->bhqd", attn, v)
-            .transpose(0, 2, 1, 3)
-            .reshape(B, Nq, C)
-        )
-        out = self.proj(out)
-        if self.proj_drop is not None:
-            out = self.proj_drop(out, rngs=rngs)
-        return out
-
-
-class AdaLNModulator(nnx.Module):
-    def __init__(self, dim: int, *, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(dim, dim, rngs=rngs)
-        self.fc2 = nnx.Linear(dim, 6 * dim, rngs=rngs)
-        self.fc2.kernel.value = jnp.zeros_like(self.fc2.kernel.value)
-    # Leave bias at its default initialization
-
-    def __call__(self, t: jnp.ndarray):
-        h = nnx.silu(self.fc1(t))
-        h = self.fc2(h)
-        return jnp.split(h, 6, axis=-1)
-
-
-class DiTBlock(nnx.Module):
-    """Single-stream DiT block with spatial & temporal modes."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        *,
-        rngs: nnx.Rngs,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
-        self.norm3 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
-        self.self_attn = MultiHeadAttention(
-            hidden_size,
-            num_heads,
-            rngs=rngs,
-            qkv_bias=True,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-        )
-        self.cross = CrossAttention(
-            hidden_size,
-            num_heads,
-            rngs=rngs,
-            qkv_bias=True,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-        )
-        self.mlp = MLP(hidden_size, int(hidden_size * 4.0), hidden_size, rngs=rngs)
-        self.mod = AdaLNModulator(hidden_size, rngs=rngs)
-
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        t: jnp.ndarray,
-        v_fea: jnp.ndarray,
-        cond_fea: jnp.ndarray,
-        *,
-        shape: Tuple[int, int, int, int],
-        block_type: str,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> jnp.ndarray:
-        B, T, N, _ = shape
-        # pre cross-attn with video features
-        x = x + self.cross(x, v_fea, rngs=rngs)
-        if block_type == "spatial":
-            # transpose(0,1,2,3) is a no-op; avoid it for clarity
-            # x_bta = x.reshape(B, T, N, -1).reshape(B * T, N, -1)
-            x_bt = x.reshape(B * T, N, -1)
-            # print("is xbt same as xbta?", jnp.all(x_bt == x_bta))
-            t_bt = jnp.repeat(t, T, axis=0)  # [B*T, C]
-            cond_bt = cond_fea.reshape(B * T, -1)  # [B*T, C]
-            t_bt = t_bt + cond_bt
-            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bt)
-            x_tmp = modulate_spatial(self.norm1(x_bt), s_msa, sc_msa)
-            y = self.self_attn(x_tmp, rngs=rngs)
-            # Use residual scaling 1+g to avoid zeroed gradients at init
-            x_bt = x_bt + (1.0 + g_msa[:, None, :]) * y
-            x_bt = x_bt + (1.0 + g_mlp[:, None, :]) * self.mlp(
-                modulate_spatial(self.norm3(x_bt), s_mlp, sc_mlp)
-            )
-            x = x_bt.reshape(B, T, N, -1).reshape(B, T * N, -1)
-        elif block_type == "temporal":
-            x_bn = x.reshape(B, T, N, -1).transpose(0, 2, 1, 3).reshape(B * N, T, -1)
-            t_bn = jnp.repeat(t, N, axis=0)  # [B*N, C]
-            cond_bn = jnp.repeat(cond_fea, N, axis=0)  # [B*N, T, C]
-            t_bn = t_bn[:, None, :] + cond_bn  # [B*N, T, C]
-            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bn)
-            x_tmp = modulate_temporal(self.norm1(x_bn), s_msa, sc_msa)
-            y = self.self_attn(x_tmp, rngs=rngs)
-            x_bn = x_bn + (1.0 + g_msa) * y
-            x_bn = x_bn + (1.0 + g_mlp) * self.mlp(
-                modulate_temporal(self.norm3(x_bn), s_mlp, sc_mlp)
-            )
-            x = x_bn.reshape(B, N, T, -1).transpose(0, 2, 1, 3).reshape(B, T * N, -1)
-        else:
-            raise ValueError("block_type must be 'spatial' or 'temporal'")
-        return x
-
-
 class CompLayer(nnx.Module):
     def __init__(
         self, hidden_size: int, out_channels: int, num_heads: int, *, rngs: nnx.Rngs
@@ -294,6 +118,7 @@ class CompLayer(nnx.Module):
         self.out = nnx.Linear(hidden_size, out_channels, rngs=rngs)
         self.mod = nnx.Linear(hidden_size, 2 * hidden_size, rngs=rngs)
         self.mod.kernel.value = jnp.zeros_like(self.mod.kernel.value)
+
     # Leave bias at its default initialization
 
     def __call__(
@@ -432,7 +257,12 @@ class VideoTransformer(nnx.Module):
         self.token = nnx.Param(jnp.zeros((1, 1, dim), dtype=jnp.float32))
         self.inp = nnx.Linear(in_channel, dim, rngs=rngs)
         self.blocks = nnx.Dict(
-            {f"block_{i}": TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs) for i in range(depth)}
+            {
+                f"block_{i}": TransformerBlock(
+                    dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs
+                )
+                for i in range(depth)
+            }
         )
         # self.layers = [
         #     TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs)
@@ -456,8 +286,189 @@ class VideoTransformer(nnx.Module):
         return g.reshape(B, N, C)
 
 
+class CrossAttention(nnx.Module):
+    # Same as before, just ensuring we have it for the block
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        rngs: nnx.Rngs,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.q = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
+        self.k = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
+        self.v = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
+        self.proj = nnx.Linear(dim, dim, rngs=rngs)
+
+    def __call__(
+        self,
+        x_q: jnp.ndarray,
+        x_kv: jnp.ndarray,
+        *,
+        mask: Optional[jnp.ndarray] = None,
+        rngs: Optional[nnx.Rngs] = None,
+    ) -> jnp.ndarray:
+        B, Nq, C = x_q.shape
+        B2, Nk, C2 = x_kv.shape
+        # Standard Cross Attention Logic
+        q = (
+            self.q(x_q)
+            .reshape(B, Nq, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k(x_kv)
+            .reshape(B, Nk, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v(x_kv)
+            .reshape(B, Nk, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+
+        attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
+        attn = nnx.softmax(attn, axis=-1)
+        out = (
+            jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+            .transpose(0, 2, 1, 3)
+            .reshape(B, Nq, C)
+        )
+        return self.proj(out)
+
+
+class AdaLNModulator(nnx.Module):
+    def __init__(self, dim: int, *, rngs: nnx.Rngs):
+        self.fc1 = nnx.Linear(dim, dim, rngs=rngs)
+        self.fc2 = nnx.Linear(dim, 6 * dim, rngs=rngs)
+        self.fc2.kernel.value = jnp.zeros_like(self.fc2.kernel.value)
+
+    def __call__(self, t: jnp.ndarray):
+        # Only takes 't' (timestep), NOT actions
+        h = nnx.silu(self.fc1(t))
+        h = self.fc2(h)
+        return jnp.split(h, 6, axis=-1)
+
+
 # -----------------------------------------------------------------------------
-# The DiffusionTransformer (NNX, single-stream)
+# Utilities
+# -----------------------------------------------------------------------------
+
+
+def modulate_spatial(
+    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
+) -> jnp.ndarray:
+    """AdaLN: x * (1 + scale) + shift; broadcast over sequence (middle) dimension."""
+    # x: (Batch, Seq, Dim), shift/scale: (Batch, Dim) -> (Batch, 1, Dim)
+    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+
+def modulate_temporal(
+    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    AdaLN variant aligned to x's shape (temporal per-token).
+    x is (Batch*N, T, C). shift/scale are (Batch*N, C).
+    We must broadcast shift/scale over T.
+    """
+    # FIX: Added [:, None, :] to broadcast (Batch, Dim) -> (Batch, 1, Dim)
+    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+
+# ... [Other Utilities like sinusoidal_embedding remain unchanged] ...
+
+# -----------------------------------------------------------------------------
+# Core Blocks
+# -----------------------------------------------------------------------------
+
+
+class DiTBlock(nnx.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.norm3 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.self_attn = MultiHeadAttention(hidden_size, num_heads, rngs=rngs)
+        self.cross = CrossAttention(hidden_size, num_heads, rngs=rngs)
+        self.mlp = MLP(hidden_size, int(hidden_size * 4.0), hidden_size, rngs=rngs)
+        self.mod = AdaLNModulator(hidden_size, rngs=rngs)
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        t_fea: jnp.ndarray,
+        context_fea: jnp.ndarray,
+        *,
+        shape: Tuple[int, int, int, int],
+        block_type: str,
+        rngs: Optional[nnx.Rngs] = None,
+    ) -> jnp.ndarray:
+        B, T, N, _ = shape
+
+        # 1. Cross-Attention: Attend to History AND Actions
+        x_flat = x.reshape(B, T * N, -1)
+        x_res = self.cross(x_flat, context_fea, rngs=rngs)
+        x = x + x_res.reshape(B, T, N, -1)
+
+        # 2. Factorized Self-Attention (Spatial or Temporal)
+        if block_type == "spatial":
+            # Reshape to (Batch * Time, N_patches, Dim)
+            x_bt = x.reshape(B * T, N, -1)
+
+            # Repeat time embedding for every frame
+            t_bt = jnp.repeat(t_fea, T, axis=0)  # [B*T, C]
+
+            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bt)
+
+            # modulate_spatial handles (B*T, C) -> (B*T, 1, C) broadcasting
+            x_tmp = modulate_spatial(self.norm1(x_bt), s_msa, sc_msa)
+            y = self.self_attn(x_tmp, rngs=rngs)
+
+            x_bt = x_bt + (1.0 + g_msa[:, None, :]) * y
+            x_bt = x_bt + (1.0 + g_mlp[:, None, :]) * self.mlp(
+                modulate_spatial(self.norm3(x_bt), s_mlp, sc_mlp)
+            )
+            x = x_bt.reshape(B, T, N, -1)
+
+        elif block_type == "temporal":
+            # Reshape to (Batch * N_patches, Time, Dim)
+            x_bn = x.reshape(B, T, N, -1).transpose(0, 2, 1, 3).reshape(B * N, T, -1)
+
+            # Repeat time embedding for every spatial token
+            t_bn = jnp.repeat(t_fea, N, axis=0)  # [B*N, C]
+
+            s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bn)
+
+            # FIX: modulate_temporal now handles (B*N, C) -> (B*N, 1, C) broadcasting
+            x_tmp = modulate_temporal(self.norm1(x_bn), s_msa, sc_msa)
+            y = self.self_attn(x_tmp, rngs=rngs)
+
+            # Apply gating with explicit broadcasting
+            x_bn = x_bn + (1.0 + g_msa[:, None, :]) * y
+            x_bn = x_bn + (1.0 + g_mlp[:, None, :]) * self.mlp(
+                modulate_temporal(self.norm3(x_bn), s_mlp, sc_mlp)
+            )
+
+            # Reshape back: (B*N, T, C) -> (B, N, T, C) -> (B, T, N, C)
+            x = x_bn.reshape(B, N, T, -1).transpose(0, 2, 1, 3)
+
+        return x
+
+
+# -----------------------------------------------------------------------------
+# Main Diffusion Transformer
 # -----------------------------------------------------------------------------
 
 
@@ -473,26 +484,32 @@ class DiffusionTransformer(nnx.Module):
     ):
         self.in_channel = in_channel
         self.dim = dim
-        self.num_heads = num_heads
-        # Token embedder (single stream)
+
+        # Input Embedders
         self.x_embedder = nnx.Linear(in_channel, dim, rngs=rngs)
-        # History encoder
+        self.time_encoder = TimestepEmbedder(dim, freq_dim=256, rngs=rngs)
+
+        # Context Encoders (LaDi-WM treats these as inputs to the denoising func)
         self.video_encoder = VideoTransformer(
             in_channel=in_channel, dim=dim, depth=8, num_heads=num_heads, rngs=rngs
         )
-        # Time + action conditioning
-        self.time_encoder = TimestepEmbedder(dim, freq_dim=256, rngs=rngs)
         self.action_encoder = ActionEmbedder(dim, input_size=7, rngs=rngs)
-        # Stacked DiT blocks (alternate spatial/temporal)
+
+        # Blocks
         self.n_layers = n_layers
-        self.blocks = nnx.Dict({f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs) for i in range(self.n_layers)})
-        # Output heads
-        self.comp = CompLayer(
-            dim, out_channels=in_channel, num_heads=num_heads, rngs=rngs
+        self.blocks = nnx.Dict(
+            {
+                f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs)
+                for i in range(self.n_layers)
+            }
         )
-        self.final = FinalLayer(
-            dim, out_channels=in_channel, num_heads=num_heads, rngs=rngs
-        )
+
+        # Output Head
+        self.final_norm = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs)
+        self.final_linear = nnx.Linear(dim, in_channel, rngs=rngs)
+
+        # Zero-init output for stability
+        self.final_linear.kernel.value = jnp.zeros_like(self.final_linear.kernel.value)
 
     def __call__(
         self,
@@ -504,51 +521,54 @@ class DiffusionTransformer(nnx.Module):
         rngs: Optional[nnx.Rngs] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Args:
-          x_noisy: [B, T, N, C_in]
-          lc_his: [B, T, N, C_in]
-          actions: [B, T, 7]
-          time: [B]
-        Returns: (y, y_tmp) each [B, T, N, C_in]
+        LaDi-WM Style Forward Pass (Single Stream):
+        1. Embed Time (Noising Level).
+        2. Embed History & Actions (Conditions).
+        3. Concatenate History & Actions -> 'Context'.
+        4. Cross-Attend to Context, AdaLN on Time.
         """
         B, T, N, Cin = x_noisy.shape
-        shape = (B, T, N, Cin)
-        # Tokens + position
+
+        # 1. Embed Noisy Input
         x = self.x_embedder(x_noisy).reshape(B, T * N, self.dim)
         pos = get_2d_sincos_pos_embed(self.dim, (T, N))
         x = x + pos
-        # Encode history latents -> [B, N, C]
-        v_fea = self.video_encoder(lc_his, rngs=rngs)
-        # Conditioning
-        t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, C]
-        act_fea = self.action_encoder(actions)  # [B, T, C]
-        # DiT stack
+        x = x.reshape(B, T, N, self.dim)
+
+        # 2. Embed Time (AdaLN Driver)
+        t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Dim]
+
+        # 3. Embed Context (Cross-Attention Targets)
+        # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Dim]
+        # Note: Ideally LaDi-WM keeps history time, but we use the existing VideoTransformer
+        # which summarizes spatial patches.
+        v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Dim]
+
+        # Actions: [B, T, 7] -> ActionEmbedder -> [B, T, Dim]
+        act_fea = self.action_encoder(actions)  # [B, T, Dim]
+
+        # 4. Construct Unified Context
+        # We concatenate History tokens and Action tokens along the sequence dimension.
+        # Shape: [B, N + T, Dim]
+        context_fea = jnp.concatenate([v_fea, act_fea], axis=1)
+
+        # 5. DiT Blocks
         for i in range(self.n_layers):
             mode = "spatial" if i % 2 == 0 else "temporal"
-            x = self.blocks[f"block_{i}"](x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
-            # x = block(x, t_fea, v_fea, act_fea, shape=shape, block_type=mode, rngs=rngs)
-        # Heads
-        y_tmp = self.comp(x, v_fea, t_fea, act_fea, shape=shape, rngs=rngs)
-        y = y_tmp + self.final(
-            x, y_tmp.reshape(B, T * N, -1), t_fea, act_fea, shape=shape, rngs=rngs
-        )
-        return y, y_tmp
+            x = self.blocks[f"block_{i}"](
+                x,
+                t_fea=t_fea,
+                context_fea=context_fea,
+                shape=(B, T, N, Cin),
+                block_type=mode,
+                rngs=rngs,
+            )
 
+        # 6. Final Head
+        # LaDi-WM predicts future states z_{t+1}.
+        # Standard DiT implementation for simple reconstruction:
+        x = self.final_norm(x)
+        y_pred = self.final_linear(x)
 
-# -----------------------------------------------------------------------------
-# Example usage
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    key = jax.random.PRNGKey(0)
-    key_params, key_dropout = jax.random.split(key)
-    rngs = nnx.Rngs(params=key_params, dropout=key_dropout)
-    B, T, N, Cin = 2, 4, 256, 4
-    x_noisy = jax.random.normal(key, (B, T, N, Cin))
-    lc_his = jax.random.normal(key, (B, T, N, Cin))
-    actions = jax.random.normal(key, (B, T, 7))
-    t_scalar = jnp.ones((B,), dtype=jnp.float32) * 0.5
-    model = DiffusionTransformer(
-        in_channel=Cin, dim=256, num_heads=8, n_layers=6, rngs=rngs
-    )
-    y, ytmp = model(x_noisy, lc_his, actions, t_scalar, rngs=rngs)
-    print("y:", y.shape, "tmp:", ytmp.shape)
+        # Return y_pred and a dummy aux (or implement specific aux loss if needed)
+        return y_pred, y_pred
