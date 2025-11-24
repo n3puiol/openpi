@@ -193,18 +193,12 @@ class Pi0Predictor(Pi0):
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         b, t, _ = actions.shape
-
-        # 1. Define Slices based on LaDi-WM logic
-        # Input: History (l frames)
-        # Target: Future (k frames)
-        # Total required frames = history_len + horizon
-        # Note: If input 't' is larger than needed, we crop to the relevant window.
-
         h_len = self._history_len
         f_len = self._horizon
 
-        # Ensure we have enough data
-        if t < h_len + f_len:
+        max_rollout_steps = (t - h_len) // f_len
+
+        if max_rollout_steps < 1:
             raise ValueError(
                 f"Insufficient action length {t} for history {h_len} and horizon {f_len}."
             )
@@ -265,37 +259,79 @@ class Pi0Predictor(Pi0):
                 emb = self.get_fused_embedding(embedding_tokens, obs_fixed)
                 return self.compute_regularized_reward(state_embedding=emb)
 
-            # def batch_reward_fn(embeddings, obs_fixed):
-            #     rewards = []
-            #     for i in range(embeddings.shape[1]):
-            #         emb = embeddings[:, i, :, :] # [B, S, Emb]
-            #         fused_emb = self.get_fused_embedding(emb, obs_fixed) # [B, Emb]
-            #         reward = self.compute_regularized_reward(state_embedding=fused_emb) # [B,]
-            #         rewards.append(reward)
-            #     return jnp.stack(rewards, axis=0)
-            # batch_reward_fn = jax.vmap(
-            #     lambda emb: get_reward_for_timestep(emb, observation),
-            #     in_axes=1,  # Map over horizon dimension
-            #     out_axes=0   # Stack results along first dimension
-            # )
-            # gt_rewards = batch_reward_fn(lc_next[:, -1:, :, :])
-            # pred_rewards = batch_reward_fn(predicted_embeddings[:, -1:, :, :])
-            gt_reward = get_reward_for_timestep(lc_next[:, -1, :, :], observation)
-            pred_reward = get_reward_for_timestep(predicted_embeddings[:, -1, :, :], observation)
-
-            # lc_next: [B, Horizon, S, Emb]
-            # predicted_embeddings: [B, Horizon, S, Emb]
-            # gt_rewards = batch_reward_fn(lc_next, observation)
-            # pred_rewards = batch_reward_fn(predicted_embeddings, observation)
+            # gt_reward = get_reward_for_timestep(lc_next[:, -1, :, :], observation)
+            # pred_reward = get_reward_for_timestep(predicted_embeddings[:, -1, :, :], observation)
 
             # Losses
             loss = jnp.mean((y_pred - c_res) ** 2)
             aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
-            reward_loss = jnp.mean((pred_reward - gt_reward) ** 2)
+            # reward_loss = jnp.mean((pred_reward - gt_reward) ** 2)
 
-            return loss + 0.1 * aux_loss + 0.2 * reward_loss
+            # total_loss = loss + 0.1 * aux_loss + 0.2 * reward_loss
+            total_loss = loss + 0.1 * aux_loss
+            return total_loss, predicted_embeddings
 
-        return compute_step_loss(lc_his, lc_next, a_future, rng)
+        lc_his = image_embeddings[:, :h_len]
+        lc_next = image_embeddings[:, h_len : h_len + f_len]
+        a_future = actions[:, h_len : h_len + f_len]
+
+        rng, step_rng = jax.random.split(rng)
+        teacher_loss, predicted_embeddings = compute_step_loss(
+            lc_his, lc_next, a_future, step_rng
+        )
+
+        def rollout_step(carry, step_idx):
+            """Single rollout step using predicted embeddings as history."""
+            predicted_emb, total_loss, rng = carry
+
+            # Use predicted embeddings as new history
+            # For stability, we can take the last h_len predictions
+            if predicted_emb.shape[1] >= h_len:
+                new_history = predicted_emb[:, -h_len:, :, :]
+            else:
+                # If we don't have enough predictions, concat with original history
+                needed = h_len - predicted_emb.shape[1]
+                new_history = jnp.concatenate(
+                    [image_embeddings[:, h_len - needed : h_len], predicted_emb], axis=1
+                )
+
+            # Ground truth target for this step
+            start_idx = h_len + (step_idx + 1) * f_len
+            start_indices = [0, start_idx, 0, 0]
+            slice_sizes = [b, f_len, s, p]
+            next_target = jax.lax.dynamic_slice(
+                image_embeddings, start_indices, slice_sizes
+            )
+
+            # Actions - use dynamic_slice
+            next_actions = jax.lax.dynamic_slice(
+                actions, [0, start_idx, 0], [b, f_len, actions.shape[2]]
+            )
+
+            # Compute loss for this rollout step
+            rng, step_rng = jax.random.split(rng)
+            step_loss, new_predictions = compute_step_loss(
+                new_history, next_target, next_actions, step_rng
+            )
+
+            return (new_predictions, total_loss + step_loss, rng), step_loss
+
+        if max_rollout_steps > 1:
+            init_carry = (predicted_embeddings, 0.0, rng)
+            (_, rollout_loss_sum, _), step_losses = jax.lax.scan(
+                rollout_step,
+                init_carry,
+                jnp.arange(max_rollout_steps - 1)
+            )
+
+            # Average rollout loss
+            rollout_loss = rollout_loss_sum / (max_rollout_steps - 1)
+        else:
+            rollout_loss = 0.0
+
+        total_loss = teacher_loss + rollout_loss
+
+        return total_loss
 
     # @override
     # def compute_loss(
