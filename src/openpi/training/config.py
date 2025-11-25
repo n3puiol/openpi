@@ -660,7 +660,7 @@ _CONFIGS = [
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
             action_dim=7,
-            action_horizon=30,
+            action_horizon=20,
             max_token_len=180,
             paligemma_variant="gemma_2b_lora",
         ),
@@ -683,16 +683,16 @@ _CONFIGS = [
             warmup_steps=2000, peak_lr=3e-5, decay_steps=20_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
-            b1=0.9, b2=0.99, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig(
             action_dim=7,
-            action_horizon=30,
+            action_horizon=20,
             max_token_len=180,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
-        batch_size=2,
+        batch_size=1,
         ema_decay=None,
     ),
     TrainConfig(

@@ -152,11 +152,12 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    horizon = (
-        range(-action_horizon // 2, action_horizon // 2)
-        if data_config.predictor
-        else range(action_horizon)
-    )
+    # horizon = (
+    #     range(-action_horizon // 2, action_horizon // 2)
+    #     if data_config.predictor
+    #     else range(action_horizon)
+    # )
+    horizon = range(action_horizon)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={

@@ -264,10 +264,6 @@ class VideoTransformer(nnx.Module):
                 for i in range(depth)
             }
         )
-        # self.layers = [
-        #     TransformerBlock(dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs)
-        #     for _ in range(depth)
-        # ]
 
     def __call__(
         self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None
@@ -280,8 +276,6 @@ class VideoTransformer(nnx.Module):
         x = jnp.concatenate([cls, x], axis=1)
         for _, block in self.blocks.items():
             x = block(x, rngs=rngs)
-        # for layer in self.layers:
-        #     x = layer(x, rngs=rngs)
         g = x[:, 0, :]
         return g.reshape(B, N, C)
 

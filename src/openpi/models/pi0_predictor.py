@@ -30,10 +30,10 @@ class Pi0PredictorConfig(Pi0Config):
 
     # Reward estimation embeddings
     baseline_embedding_path: str = (
-        "reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
+        "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
     )
     goal_embedding_path: str = (
-        "reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
+        "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
     )
     alpha: float = 0.5  # blending factor for regularized reward
 
@@ -67,8 +67,8 @@ class Pi0Predictor(Pi0):
             config.history_len
         )  # This is 'l' (history length), fixed to 4 in LaDi-WM
 
-        # self._baseline_embedding_path = jnp.load(config.baseline_embedding_path)
-        # self._goal_embedding_path = jnp.load(config.goal_embedding_path)
+        self.baseline_embedding = nnx.Variable(jnp.load(config.baseline_embedding_path))
+        self.goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
         self._alpha = config.alpha
 
         self._diffusion_transformer = DiffusionTransformer(
@@ -207,24 +207,11 @@ class Pi0Predictor(Pi0):
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
-        # 2. Slice Data
-        # History: z_{t-l:t}
-        lc_his = image_embeddings[:, :h_len]
-
-        # Future Target: z_{t+1:t+k}
-        lc_next = image_embeddings[:, h_len : h_len + f_len]
-
-        # Future Actions: a_{t:t+k} (Condition for the specific future frames)
-        a_future = actions[:, h_len : h_len + f_len]
-
-        # 3. Compute Step Loss
         def compute_step_loss(lc_his, lc_next, a_future, rng):
-            # Prior frame (last frame of history)
+            """Compute loss for a single prediction step."""
             x_prior = lc_his[:, -1:, :]
 
             # Build Residual Target (Velocity)
-            # Concatenate last history frame with future to compute diffs
-            # Target shape: [B, Horizon, S, Emb]
             targets_concat = jnp.concatenate([x_prior, lc_next], axis=1)
             target_velocity = jnp.diff(targets_concat, axis=1)
             c_res = -target_velocity  # Drift term
@@ -244,31 +231,43 @@ class Pi0Predictor(Pi0):
             x_noisy = self.add_noise(target_velocity, noise, timestep, c_res)
 
             # Forward Pass
-            # Note: We pass a_future as the explicit action condition
             y_pred, y_pred_tmp = self._diffusion_transformer(
                 x_noisy, lc_his, a_future, timestep
             )
 
             # Reconstruction for Reward Calculation
-            # We must cumsum the predicted velocity and add to x_prior
-            # y_pred is [B, Horizon, S, Emb]
             pred_cumulative_delta = jnp.cumsum(y_pred, axis=1)
             predicted_embeddings = x_prior + pred_cumulative_delta
 
-            def get_reward_for_timestep(embedding_tokens, obs_fixed):
-                emb = self.get_fused_embedding(embedding_tokens, obs_fixed)
-                return self.compute_regularized_reward(state_embedding=emb)
+            # Compute rewards for last timestep
+            # def get_reward_for_timestep(embedding_tokens, obs_fixed):
+            #     print("embedding_tokens shape: ", embedding_tokens.shape)
+            #     emb = self.get_fused_embedding(embedding_tokens, obs_fixed)
+            #     reward = self.compute_regularized_reward(state_embedding=emb)
+            #     print("Computed reward:", reward.shape)
+            #     return reward
+
+            # batch_reward_fn = jax.vmap(
+            #     lambda emb: get_reward_for_timestep(emb, observation),
+            #     in_axes=1,  # Map over horizon dimension
+            #     out_axes=0,  # Stack results along first dimension
+            # )
 
             # gt_reward = get_reward_for_timestep(lc_next[:, -1, :, :], observation)
             # pred_reward = get_reward_for_timestep(predicted_embeddings[:, -1, :, :], observation)
 
+            # gt_rewards = batch_reward_fn(lc_next)  # [Horizon]
+            # pred_rewards = batch_reward_fn(predicted_embeddings)  # [Horizon]
+
             # Losses
             loss = jnp.mean((y_pred - c_res) ** 2)
             aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
-            # reward_loss = jnp.mean((pred_reward - gt_reward) ** 2)
 
-            # total_loss = loss + 0.1 * aux_loss + 0.2 * reward_loss
             total_loss = loss + 0.1 * aux_loss
+
+            # gt_reward_mean = jnp.mean(gt_rewards, axis=0)
+            # pred_reward_mean = jnp.mean(pred_rewards, axis=0)
+
             return total_loss, predicted_embeddings
 
         lc_his = image_embeddings[:, :h_len]
@@ -276,8 +275,8 @@ class Pi0Predictor(Pi0):
         a_future = actions[:, h_len : h_len + f_len]
 
         rng, step_rng = jax.random.split(rng)
-        teacher_loss, predicted_embeddings = compute_step_loss(
-            lc_his, lc_next, a_future, step_rng
+        teacher_loss, predicted_embeddings = (
+            compute_step_loss(lc_his, lc_next, a_future, step_rng)
         )
 
         def rollout_step(carry, step_idx):
@@ -285,11 +284,9 @@ class Pi0Predictor(Pi0):
             predicted_emb, total_loss, rng = carry
 
             # Use predicted embeddings as new history
-            # For stability, we can take the last h_len predictions
             if predicted_emb.shape[1] >= h_len:
                 new_history = predicted_emb[:, -h_len:, :, :]
             else:
-                # If we don't have enough predictions, concat with original history
                 needed = h_len - predicted_emb.shape[1]
                 new_history = jnp.concatenate(
                     [image_embeddings[:, h_len - needed : h_len], predicted_emb], axis=1
@@ -314,11 +311,29 @@ class Pi0Predictor(Pi0):
                 new_history, next_target, next_actions, step_rng
             )
 
-            return (new_predictions, total_loss + step_loss, rng), step_loss
+            return (new_predictions, total_loss + step_loss, rng), (step_loss)
+
+        def trend_loss(y_true, y_pred):
+            """Compute trend loss based on reward trajectory similarity."""
+            # Only compute if we have multiple timesteps
+            if y_true.shape[0] < 2:
+                return 0.0
+
+            # Calculate velocity (differences between consecutive rewards)
+            diff_true = jnp.diff(y_true, axis=0)
+            diff_pred = jnp.diff(y_pred, axis=0)
+
+            # Use MSE on velocity instead of cosine similarity (more stable)
+            velocity_loss = jnp.mean((diff_true - diff_pred) ** 2)
+
+            # Clip to prevent extreme values
+            velocity_loss = jnp.clip(velocity_loss, 0.0, 1.0)
+
+            return velocity_loss
 
         if max_rollout_steps > 1:
             init_carry = (predicted_embeddings, 0.0, rng)
-            (_, rollout_loss_sum, _), step_losses = jax.lax.scan(
+            (_, rollout_loss_sum, _), (step_losses) = jax.lax.scan(
                 rollout_step,
                 init_carry,
                 jnp.arange(max_rollout_steps - 1)
@@ -328,6 +343,12 @@ class Pi0Predictor(Pi0):
             rollout_loss = rollout_loss_sum / (max_rollout_steps - 1)
         else:
             rollout_loss = 0.0
+
+        jax.debug.print(
+            "teacher_loss: {}, rollout_loss: {}",
+            teacher_loss,
+            rollout_loss,
+        )
 
         total_loss = teacher_loss + rollout_loss
 
@@ -666,14 +687,14 @@ class Pi0Predictor(Pi0):
 
     def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
         s = state_embedding
-        # g = self._goal_embedding_path
-        # b = self._baseline_embedding_path
-        g = jnp.load(
-            "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
-        )
-        b = jnp.load(
-            "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
-        )
+        g = self.goal_embedding.value
+        b = self.baseline_embedding.value
+        # g = jnp.load(
+        #     "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
+        # )
+        # b = jnp.load(
+        #     "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
+        # )
 
         direction_vector = g - b
         direction_vector_norm_sq = jnp.sum(direction_vector**2)
