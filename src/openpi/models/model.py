@@ -228,7 +228,7 @@ class BaseModelConfig(abc.ABC):
     def create(self, rng: at.KeyArrayLike) -> "BaseModel":
         """Create a new model, initializing parameters."""
 
-    def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
+    def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":        
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)

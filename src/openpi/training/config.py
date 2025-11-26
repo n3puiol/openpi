@@ -659,16 +659,18 @@ _CONFIGS = [
         name="pi0_libero_predictor",
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
-            action_dim=7,
             action_horizon=20,
-            max_token_len=180,
-            paligemma_variant="gemma_2b_lora",
+            # max_token_len=180,
+            # paligemma_variant="gemma_2b_lora",
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(
-                assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero_predictor/assets",
+                assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero/assets",
             ),
+            # assets=AssetsConfig(
+            #     assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero_predictor/assets",
+            # ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
@@ -686,11 +688,10 @@ _CONFIGS = [
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig(
-            action_dim=7,
             action_horizon=20,
-            max_token_len=180,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            # max_token_len=180,
+            # paligemma_variant="gemma_2b_lora",
+            # action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         batch_size=1,
         ema_decay=None,

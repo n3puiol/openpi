@@ -87,9 +87,6 @@ class Pi0Predictor(Pi0):
     def embed_inputs(
         self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
     ) -> at.Float[at.Array, "*b s emb"]:
-        observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
-        )
         return self.PaliGemma.img(observation.images[self._image_key], train=False)[0]
 
     @override
@@ -112,6 +109,10 @@ class Pi0Predictor(Pi0):
                 f"Insufficient action length {t} for history {h_len} and horizon {f_len}."
             )
 
+        observation = _model.preprocess_observation(
+            rng, observation, train=train, image_keys=list(observation.images.keys())
+        )
+
         image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
@@ -119,6 +120,7 @@ class Pi0Predictor(Pi0):
         def compute_step_loss(lc_his, lc_next, a_future, rng):
             """Compute loss for a single prediction step."""
             x_prior = lc_his[:, -1:, :]
+            action_tokens = self.action_in_proj(a_future)
 
             # Build Residual Target (Velocity)
             targets_concat = jnp.concatenate([x_prior, lc_next], axis=1)
@@ -140,21 +142,20 @@ class Pi0Predictor(Pi0):
             x_noisy = self.add_noise(target_velocity, noise, timestep, c_res)
 
             # Forward Pass
-            y_pred, y_pred_tmp = self._diffusion_transformer(
-                x_noisy, lc_his, a_future, timestep
+            y_pred = self._diffusion_transformer(
+                x_noisy, lc_his, action_tokens, timestep
             )
 
             # Reconstruction
             pred_cumulative_delta = jnp.cumsum(y_pred, axis=1)
             predicted_embeddings = x_prior + pred_cumulative_delta
+            # emb_loss = jnp.mean((predicted_embeddings - lc_next) ** 2)
+            # jax.debug.print("Embedding loss: {}", emb_loss)
 
             # Losses
             loss = jnp.mean((y_pred - c_res) ** 2)
-            aux_loss = jnp.mean((y_pred_tmp - c_res) ** 2)
 
-            total_loss = loss + 0.1 * aux_loss
-
-            return total_loss, predicted_embeddings
+            return loss, predicted_embeddings
 
         lc_his = image_embeddings[:, :h_len]
         lc_next = image_embeddings[:, h_len : h_len + f_len]
@@ -358,14 +359,18 @@ class Pi0Predictor(Pi0):
         train: bool = False,
     ):
         b, t, _ = actions.shape
+        observation = _model.preprocess_observation(
+            rng, observation, train=train, image_keys=list(observation.images.keys())
+        )
         image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
+        action_tokens = self.action_in_proj(actions)
+
         _, s, p = image_embeddings.shape
         image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
 
         # Split into history and future segments
         lc_his = image_embeddings
         x_prior = lc_his[:, -1:, :]  # (b, 1, 256, 2048)
-        a_next = actions  # (b, horizon, 7)
 
         # Split RNG to avoid correlation between timestep sampling and noise
         rng_t, rng_n = jax.random.split(rng)
@@ -377,7 +382,8 @@ class Pi0Predictor(Pi0):
         x_noisy = jax.random.normal(rng_n, shape=lc_his.shape)
 
         # Forward through diffusion transformer
-        y_pred, _ = self._diffusion_transformer(x_noisy, lc_his, a_next, timestep)
+        # y_pred = self._diffusion_transformer(x_noisy, lc_his, a_next, timestep)
+        y_pred = self._diffusion_transformer(x_noisy, lc_his, action_tokens, timestep)
         pred_cumulative_delta = jnp.cumsum(y_pred, axis=1)
         predicted_embedding = x_prior + pred_cumulative_delta
 
