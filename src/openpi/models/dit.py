@@ -422,40 +422,41 @@ class DiTBlock(nnx.Module):
 class DiffusionTransformer(nnx.Module):
     def __init__(
         self,
-        in_channel: int = 3,
-        dim: int = 768,
-        num_heads: int = 8,
-        n_layers: int = 12,
-        freq_dim: int = 256,
-        video_depth: int = 8,
-        epsilon: float = 1e-6,
+        in_channel,
+        hidden_size,
+        num_heads,
+        n_layers,
+        freq_dim,
+        video_depth,
+        epsilon,
         *,
         rngs: nnx.Rngs,
     ):
         self.in_channel = in_channel
-        self.dim = dim
+        self.hidden_size = hidden_size
 
         # Input Embedders
-        self.x_embedder = nnx.Linear(in_channel, dim, rngs=rngs)
-        self.time_encoder = TimestepEmbedder(dim, freq_dim=freq_dim, rngs=rngs)
+        self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
+        self.time_encoder = TimestepEmbedder(hidden_size, freq_dim=freq_dim, rngs=rngs)
+        self.action_embedder = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
 
         # Context Encoders (LaDi-WM treats these as inputs to the denoising func)
         self.video_encoder = VideoTransformer(
-            in_channel=in_channel, dim=dim, depth=video_depth, num_heads=num_heads, rngs=rngs
+            in_channel=in_channel, dim=hidden_size, depth=video_depth, num_heads=num_heads, rngs=rngs
         )
 
         # Blocks
         self.n_layers = n_layers
         self.blocks = nnx.Dict(
             {
-                f"block_{i}": DiTBlock(dim, num_heads, rngs=rngs)
+                f"block_{i}": DiTBlock(hidden_size, num_heads, rngs=rngs)
                 for i in range(self.n_layers)
             }
         )
 
         # Output Head
-        self.final_norm = nnx.LayerNorm(dim, epsilon=epsilon, rngs=rngs)
-        self.final_linear = nnx.Linear(dim, in_channel, rngs=rngs)
+        self.final_norm = nnx.LayerNorm(hidden_size, epsilon=epsilon, rngs=rngs)
+        self.final_linear = nnx.Linear(hidden_size, in_channel, rngs=rngs)
 
         # Zero-init output for stability
         self.final_linear.kernel.value = jnp.zeros_like(self.final_linear.kernel.value)
@@ -472,19 +473,21 @@ class DiffusionTransformer(nnx.Module):
         B, T, N, Cin = x_noisy.shape
 
         # Embed Noisy Input
-        x = self.x_embedder(x_noisy).reshape(B, T * N, self.dim)
-        pos = get_2d_sincos_pos_embed(self.dim, (T, N))
+        x = self.x_embedder(x_noisy).reshape(B, T * N, self.hidden_size)
+        pos = get_2d_sincos_pos_embed(self.hidden_size, (T, N))
         x = x + pos
-        x = x.reshape(B, T, N, self.dim)
+        x = x.reshape(B, T, N, self.hidden_size)
 
         # Embed Time (AdaLN Driver)
-        t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Dim]
+        t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Hidden_Size]
 
         # Embed Context (Cross-Attention Targets)
-        # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Dim]
-        v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Dim]
+        # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Hidden_Size]
+        v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Hidden_Size]
 
-        context_fea = jnp.concatenate([v_fea, action_tokens], axis=1)
+        a_fea = self.action_embedder(action_tokens)  # [B, T, Hidden_Size]
+
+        context_fea = jnp.concatenate([v_fea, a_fea], axis=1)
 
         ctx_mask = make_block_causal_mask(T, N)
 

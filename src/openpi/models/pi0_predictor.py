@@ -20,6 +20,8 @@ class Pi0PredictorConfig(Pi0Config):
     hidden_size: int = 1024
     num_heads: int = 8
     num_layers: int = 12
+    freq_dim: int = 256
+    video_depth: int = 8
     eps: float = 1e-5
     image_key: str = "base_0_rgb"
     rollout_factor: float = 1.0
@@ -71,9 +73,12 @@ class Pi0Predictor(Pi0):
 
         self._diffusion_transformer = DiffusionTransformer(
             in_channel=config.in_channel,
-            dim=config.hidden_size,
+            hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             n_layers=config.num_layers,
+            freq_dim=config.freq_dim,
+            video_depth=config.video_depth,
+            epsilon=config.eps,
             rngs=rngs,
         )
 
