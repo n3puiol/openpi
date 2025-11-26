@@ -522,7 +522,7 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    val_split: float = 0.1  # Fraction of data to use for validation
+    val_split: float = 0  # Fraction of data to use for validation
     val_interval: int = 1000  # Run validation every N steps
     max_val_batches: int | None = 100  # Limit validation batches
 

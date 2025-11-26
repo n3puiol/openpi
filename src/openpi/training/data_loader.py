@@ -166,15 +166,15 @@ def create_torch_dataset(
         },
     )
     
-        # Split dataset into train and validation
-    total_size = len(dataset)
-    val_size = int(total_size * val_split)
-    train_size = total_size - val_size
+    # Split dataset into train and validation
+    # total_size = len(dataset)
+    # val_size = int(total_size * val_split)
+    # train_size = total_size - val_size
     
-    if train:
-        dataset = torch.utils.data.Subset(dataset, range(train_size))
-    else:
-        dataset = torch.utils.data.Subset(dataset, range(train_size, total_size))
+    # if train:
+    #     dataset = torch.utils.data.Subset(dataset, range(train_size))
+    # else:
+    #     dataset = torch.utils.data.Subset(dataset, range(train_size, total_size))
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(

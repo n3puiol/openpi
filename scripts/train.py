@@ -206,10 +206,10 @@ def val_step(
 
     val_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
-    
+
     chunked_loss = model.compute_loss(val_rng, observation, actions, train=False)
     loss = jnp.mean(chunked_loss)
-    
+
     return {"val_loss": loss}
 
 
@@ -248,14 +248,14 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     
-    val_data_loader = _data_loader.create_data_loader(
-        config,
-        sharding=data_sharding,
-        shuffle=False,
-        train=False,
-        val_split=config.val_split,
-        num_batches=config.max_val_batches,
-    )
+    # val_data_loader = _data_loader.create_data_loader(
+    #     config,
+    #     sharding=data_sharding,
+    #     shuffle=False,
+    #     train=False,
+    #     val_split=config.val_split,
+    #     num_batches=config.max_val_batches,
+    # )
     
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -281,11 +281,11 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
     
-    pval_step = jax.jit(
-        functools.partial(val_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=replicated_sharding,
-    )
+    # pval_step = jax.jit(
+    #     functools.partial(val_step, config),
+    #     in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+    #     out_shardings=replicated_sharding,
+    # )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -308,18 +308,18 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             infos = []
         
-        if step % config.val_interval == 0 and step > start_step:
-            val_infos = []
-            for val_batch in val_data_loader:
-                with sharding.set_mesh(mesh):
-                    val_info = pval_step(val_rng, train_state, val_batch)
-                val_infos.append(val_info)
+        # if step % config.val_interval == 0 and step > start_step:
+        #     val_infos = []
+        #     for val_batch in val_data_loader:
+        #         with sharding.set_mesh(mesh):
+        #             val_info = pval_step(val_rng, train_state, val_batch)
+        #         val_infos.append(val_info)
             
-            stacked_val_infos = common_utils.stack_forest(val_infos)
-            reduced_val_info = jax.device_get(jax.tree.map(jnp.mean, stacked_val_infos))
-            val_info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val_info.items())
-            pbar.write(f"Step {step} (validation): {val_info_str}")
-            wandb.log(reduced_val_info, step=step)    
+        #     stacked_val_infos = common_utils.stack_forest(val_infos)
+        #     reduced_val_info = jax.device_get(jax.tree.map(jnp.mean, stacked_val_infos))
+        #     val_info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val_info.items())
+        #     pbar.write(f"Step {step} (validation): {val_info_str}")
+        #     wandb.log(reduced_val_info, step=step)    
         
         batch = next(data_iter)
 
