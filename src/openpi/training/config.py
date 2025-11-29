@@ -678,9 +678,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_libero/params"
         ),
-        num_train_steps=20_000,
+        num_train_steps=40_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000, peak_lr=3e-5, decay_steps=20_000, decay_lr=1e-6
+            warmup_steps=2000, peak_lr=3e-5, decay_steps=40_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0

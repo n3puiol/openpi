@@ -19,12 +19,11 @@ class Pi0PredictorConfig(Pi0Config):
     in_channel: int = 2048
     hidden_size: int = 1024
     num_heads: int = 8
-    num_layers: int = 8
+    num_layers: int = 12
     freq_dim: int = 256
-    video_depth: int = 4
+    video_depth: int = 6
     eps: float = 1e-5
     image_key: str = "base_0_rgb"
-    rollout_factor: float = 1.0
     horizon: int = 5
     history_len: int = 5
 
@@ -61,11 +60,8 @@ class Pi0Predictor(Pi0):
 
         self._eps = config.eps
         self._image_key = config.image_key
-        self._rollout_factor = config.rollout_factor
         self._horizon = config.horizon  # This is 'k' (prediction length)
-        self._history_len = (
-            config.history_len
-        )  # This is 'l' (history length), fixed to 4 in LaDi-WM
+        self._history_len = config.history_len  # This is 'h' (history length)
 
         self.baseline_embedding = nnx.Variable(jnp.load(config.baseline_embedding_path))
         self.goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
@@ -104,121 +100,82 @@ class Pi0Predictor(Pi0):
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         b, t, _ = actions.shape
-        h_len = self._history_len
-        f_len = self._horizon
+        h_len, f_len = self._history_len, self._horizon
 
-        max_rollout_steps = (t - h_len) // f_len
+        # Calculate how many full windows fit in the sequence
+        num_windows = (t - h_len) // f_len
+        if num_windows < 1:
+            raise ValueError(f"Insufficient sequence length {t} for H={h_len}, F={f_len}")
 
-        if max_rollout_steps < 1:
-            raise ValueError(
-                f"Insufficient action length {t} for history {h_len} and horizon {f_len}."
-            )
+        # Embed observations (B, T, ...)
+        obs_p = _model.preprocess_observation(rng, observation, train=train, image_keys=list(observation.images.keys()))
+        embeddings = self.embed_inputs(obs_p, train=train, rng=rng) # (B, T, S, P)
+        embeddings = jnp.reshape(embeddings, (b, t, -1, embeddings.shape[-1]))
 
-        observation = _model.preprocess_observation(
-            rng, observation, train=train, image_keys=list(observation.images.keys())
-        )
+        # We slice out the Initial History and the Future Targets/Actions
+        # init_history: (B, h_len, N, C)
+        init_history = embeddings[:, :h_len]
 
-        image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
-        _, s, p = image_embeddings.shape
-        image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
+        # Reshape Targets and Actions into: (Num_Windows, B, f_len, ...)
+        # This allows scan to iterate over the first dimension automatically
+        valid_len = num_windows * f_len
 
-        def compute_step_loss(lc_his, lc_next, a_future, rng):
-            """Compute loss for a single prediction step."""
-            x_prior = lc_his[:, -1:, :]
-            action_tokens = self.action_in_proj(a_future)
+        targets = embeddings[:, h_len : h_len + valid_len]
+        targets = targets.reshape(num_windows, b, f_len, *targets.shape[2:])
 
-            # Build Residual Target (Velocity)
-            targets_concat = jnp.concatenate([x_prior, lc_next], axis=1)
-            target_velocity = jnp.diff(targets_concat, axis=1)
-            c_res = -target_velocity  # Drift term
+        act_seq = actions[:, h_len : h_len + valid_len]
+        act_seq = act_seq.reshape(num_windows, b, f_len, *act_seq.shape[2:])
 
-            # Split RNG
-            rng_t, rng_n = jax.random.split(rng)
-            timestep = (
-                jax.random.uniform(
-                    rng_t, shape=(c_res.shape[0],), minval=0.0, maxval=1.0
-                )
-                * (1.0 - self._eps)
-                + self._eps
-            )
-            noise = jax.random.normal(rng_n, shape=c_res.shape)
+        def scan_step(carry, inputs):
+            # Carry holds the rolling history buffer; Inputs are the next window slices
+            curr_history, rng = carry
+            target_window, action_window = inputs
 
-            # Add Noise
-            x_noisy = self.add_noise(target_velocity, noise, timestep, c_res)
+            B, T, N, C = target_window.shape
 
-            # Forward Pass
-            y_pred = self._diffusion_transformer(
-                x_noisy, lc_his, action_tokens, timestep
-            )
+            # --- Flow Matching Math ---
+            x_prior = curr_history[:, -1:, :, :] # Last frame of history is x_0
 
-            # Reconstruction
-            pred_cumulative_delta = jnp.cumsum(y_pred, axis=1)
-            predicted_embeddings = x_prior + pred_cumulative_delta
-            # emb_loss = jnp.mean((predicted_embeddings - lc_next) ** 2)
-            # jax.debug.print("Embedding loss: {}", emb_loss)
+            # Target Velocity (Flow Matching)
+            target_residual = target_window - x_prior
 
-            # Losses
-            loss = jnp.mean((y_pred - c_res) ** 2)
+            # Action Projection & Dropout
+            a_tokens = self.action_in_proj(action_window)
+            if train:
+                rng, r_drop = jax.random.split(rng)
+                mask = jax.random.bernoulli(r_drop, p=0.12, shape=(B, 1, 1))
+                a_tokens = jnp.where(mask, 0.0, a_tokens)
 
-            return loss, predicted_embeddings
+            # Noise & Timesteps (Diffusion Forcing)
+            rng, r_time, r_noise = jax.random.split(rng, 3)
+            timestep = jax.random.uniform(r_time, (B,), minval=0.001, maxval=0.999)
+            t_bc = timestep[:, None, None, None]
 
-        lc_his = image_embeddings[:, :h_len]
-        lc_next = image_embeddings[:, h_len : h_len + f_len]
-        a_future = actions[:, h_len : h_len + f_len]
+            noise = jax.random.normal(r_noise, target_residual.shape)
+            x_noisy = (1 - t_bc) * target_residual + t_bc * noise
 
-        rng, step_rng = jax.random.split(rng)
-        teacher_loss, predicted_embeddings = compute_step_loss(
-            lc_his, lc_next, a_future, step_rng
-        )
+            # Predict Velocity
+            v_pred = self._diffusion_transformer(x_noisy, curr_history, a_tokens, timestep.flatten())
 
-        def rollout_step(carry, step_idx):
-            """Single rollout step using predicted embeddings as history."""
-            predicted_emb, total_loss, rng = carry
+            # Loss: v_pred should match (epsilon - x_data)
+            # Note: Your original target was `noise - target_residual`
+            loss = jnp.mean((v_pred - (noise - target_residual)) ** 2)
 
-            # Use predicted embeddings as new history
-            if predicted_emb.shape[1] >= h_len:
-                new_history = predicted_emb[:, -h_len:, :, :]
-            else:
-                needed = h_len - predicted_emb.shape[1]
-                new_history = jnp.concatenate(
-                    [image_embeddings[:, h_len - needed : h_len], predicted_emb], axis=1
-                )
+            # Reconstruct Data for Next History (x_data = x_t - t * v)
+            pred_data = x_noisy - (t_bc * v_pred)
 
-            # Ground truth target for this step
-            start_idx = h_len + (step_idx + 1) * f_len
-            start_indices = [0, start_idx, 0, 0]
-            slice_sizes = [b, f_len, s, p]
-            next_target = jax.lax.dynamic_slice(
-                image_embeddings, start_indices, slice_sizes
-            )
+            # --- Update History Buffer (Sliding Window) ---
+            # Drop oldest f_len frames, append predicted data
+            next_history = jnp.concatenate([curr_history[:, f_len:], pred_data], axis=1)
+            next_history = next_history.astype(curr_history.dtype)
 
-            # Actions - use dynamic_slice
-            next_actions = jax.lax.dynamic_slice(
-                actions, [0, start_idx, 0], [b, f_len, actions.shape[2]]
-            )
+            return (next_history, rng), loss
 
-            # Compute loss for this rollout step
-            rng, step_rng = jax.random.split(rng)
-            step_loss, new_predictions = compute_step_loss(
-                new_history, next_target, next_actions, step_rng
-            )
+        # Iterate over the reshaped windows
+        init_carry = (init_history, rng)
+        _, losses = jax.lax.scan(scan_step, init_carry, (targets, act_seq))
 
-            return (new_predictions, total_loss + step_loss, rng), (step_loss)
-
-        if max_rollout_steps > 1:
-            init_carry = (predicted_embeddings, 0.0, rng)
-            (_, rollout_loss_sum, _), (step_losses) = jax.lax.scan(
-                rollout_step, init_carry, jnp.arange(max_rollout_steps - 1)
-            )
-
-            # Average rollout loss
-            rollout_loss = rollout_loss_sum / (max_rollout_steps - 1)
-        else:
-            rollout_loss = 0.0
-
-        total_loss = teacher_loss + rollout_loss
-
-        return total_loss
+        return jnp.mean(losses)
 
     def get_fused_embedding(self, image_tokens, obs):
         input_mask = []
@@ -256,7 +213,7 @@ class Pi0Predictor(Pi0):
         num_valid_tokens = jnp.sum(input_mask, axis=1, keepdims=True)
         pooled_fused_embedding = summed_embeddings / jnp.maximum(num_valid_tokens, 1)
         return pooled_fused_embedding
-
+    
     def predict_future(
         self,
         rng: at.KeyArrayLike,
@@ -268,99 +225,60 @@ class Pi0Predictor(Pi0):
         b, t, _ = actions.shape
         h_len = self._history_len
         f_len = self._horizon
+        num_steps = (t - h_len) // f_len
 
-        # Calculate number of rollout steps possible
-        max_rollout_steps = (t - h_len) // f_len
+        if num_steps < 1:
+            raise ValueError(f"Insufficient sequence length {t} for history {h_len} and horizon {f_len}.")
 
-        if max_rollout_steps < 1:
-            raise ValueError(
-                f"Insufficient sequence length {t} for history {h_len} and horizon {f_len}."
-            )
-
+        # Preprocess and embed observations
         observation = _model.preprocess_observation(
             rng, observation, train=train, image_keys=list(observation.images.keys())
         )
         image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
+        image_embeddings = jnp.reshape(image_embeddings, (b, t, -1, image_embeddings.shape[-1]))
 
-        _, s, p = image_embeddings.shape
-        image_embeddings = jnp.reshape(image_embeddings, (b, t, s, p))
-
-        def predict_step(lc_his, a_future, rng):
-            """Predict future embeddings for a single step."""
-            x_prior = lc_his[:, -1:, :]  # (b, 1, s, p)
-            action_tokens = self.action_in_proj(a_future)
-
-            # Split RNG
+        def predict_step(history, future_actions, rng):
+            """Predict next embeddings from history and actions."""
+            x_prior = history[:, -1:, :, :]
+            B, T, N, C = history.shape
+            
+            action_tokens = self.action_in_proj(future_actions)
             rng_t, rng_n = jax.random.split(rng)
-            timestep = (
-                jax.random.uniform(
-                    rng_t, shape=(x_prior.shape[0],), minval=0.0, maxval=1.0
-                )
-                * (1.0 - self._eps)
-                + self._eps
-            )
-            x_noisy = jax.random.normal(rng_n, shape=(b, f_len, s, p))
+            timestep = jax.random.uniform(rng_t, (B,), minval=0.02, maxval=0.98)
+            noise = jax.random.normal(rng_n, (B, T, N, C))
+            x_noisy = noise * timestep[:, None, None, None]
+            
+            y_pred = self._diffusion_transformer(x_noisy, history, action_tokens, timestep)
+            predicted =  x_prior - y_pred
+            return predicted.astype(history.dtype)
 
-            # Forward through diffusion transformer
-            y_pred = self._diffusion_transformer(
-                x_noisy, lc_his, action_tokens, timestep
-            )
-            pred_cumulative_delta = jnp.cumsum(y_pred, axis=1)
-            predicted_embedding = x_prior + pred_cumulative_delta
-
-            return predicted_embedding
-
-        # Split into history and future segments
-        lc_his = image_embeddings[:, :h_len]
-        # First prediction step
-        a_future = actions[:, h_len : h_len + f_len]
-        rng, step_rng = jax.random.split(rng)
-        first_predictions = predict_step(lc_his, a_future, step_rng)
-
-        all_predictions = [lc_his, first_predictions]
-
-        def rollout_step(carry, step_idx):
-            """Single rollout step using predicted embeddings as history."""
-            predicted_emb, rng = carry
-
-            # Get next actions
-            start_idx = h_len + (step_idx + 1) * f_len
-            next_actions = jax.lax.dynamic_slice(
-                actions, [0, start_idx, 0], [b, f_len, actions.shape[2]]
-            )
-
-            # Predict next segment
+        def scan_step(carry, step_idx):
+            """Rollout step for scan."""
+            history, rng = carry
             rng, step_rng = jax.random.split(rng)
-            new_predictions = predict_step(predicted_emb, next_actions, step_rng)
+            
+            start_idx = h_len + step_idx * f_len
+            step_actions = jax.lax.dynamic_slice(actions, [0, start_idx, 0], [b, f_len, actions.shape[2]])
+            
+            predictions = predict_step(history, step_actions, step_rng)
+            return (predictions, rng), predictions
 
-            return (new_predictions, rng), new_predictions
+        # Run all prediction steps via scan
+        init_history = image_embeddings[:, :h_len]
+        _, all_preds = jax.lax.scan(scan_step, (init_history, rng), jnp.arange(num_steps))
+        
+        # Reshape: (num_steps, b, f_len, s, p) -> (b, num_steps * f_len, s, p)
+        all_preds = einops.rearrange(all_preds, "n b t s p -> b (n t) s p")
+        all_predictions = jnp.concatenate([init_history, all_preds], axis=1)
 
-        if max_rollout_steps > 1:
-            init_carry = (first_predictions, rng)
-            _, rollout_predictions = jax.lax.scan(
-                rollout_step, init_carry, jnp.arange(max_rollout_steps - 1)
-            )
-            # rollout_predictions shape: (max_rollout_steps - 1, b, f_len, s, p)
-            # Reshape to (b, (max_rollout_steps - 1) * f_len, s, p)
-            rollout_predictions = jnp.reshape(
-                rollout_predictions,
-                (b, (max_rollout_steps - 1) * f_len, s, p),
-            )
-            all_predictions.append(rollout_predictions)
-
-        all_predictions = jnp.concatenate(all_predictions, axis=1)
-
+        # Compute fused embeddings for all timesteps
         def compute_fused_for_timestep(img_tokens):
             return self.get_fused_embedding(img_tokens, observation)
 
-        # Use vmap to parallelize across time dimension
         batch_fused_fn = jax.vmap(compute_fused_for_timestep, in_axes=1, out_axes=1)
-
-        past_fused_embeddings = batch_fused_fn(image_embeddings)  # (b, t, emb_dim)
-        future_fused_embeddings = batch_fused_fn(all_predictions)  # (b, t, emb_dim)
-
-        # emb_loss = jnp.mean((past_fused_embeddings - future_fused_embeddings) ** 2)
-        # jax.debug.print("Fused embedding MSE loss: {}", emb_loss)
+        
+        past_fused_embeddings = batch_fused_fn(image_embeddings)
+        future_fused_embeddings = batch_fused_fn(all_predictions)
 
         return past_fused_embeddings, future_fused_embeddings
 
