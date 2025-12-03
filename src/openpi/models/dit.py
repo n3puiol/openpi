@@ -420,15 +420,16 @@ class DiTBlock(nnx.Module):
 
 
 class DiffusionTransformer(nnx.Module):
+
     def __init__(
         self,
-        in_channel,
-        hidden_size,
-        num_heads,
-        n_layers,
-        freq_dim,
-        video_depth,
-        epsilon,
+        in_channel: int,
+        hidden_size: int,
+        num_heads: int,
+        n_layers: int,
+        freq_dim: int,
+        video_depth: int,
+        epsilon: float,
         *,
         rngs: nnx.Rngs,
     ):
