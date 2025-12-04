@@ -659,7 +659,7 @@ _CONFIGS = [
         name="pi0_libero_predictor",
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
-            action_horizon=20,
+            action_horizon=10,
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -685,10 +685,8 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
-        freeze_filter=pi0_predictor.Pi0PredictorConfig(
-            action_horizon=20,
-        ).get_freeze_filter(),
-        batch_size=1,
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=4,
         ema_decay=None,
     ),
     TrainConfig(

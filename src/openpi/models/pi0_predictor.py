@@ -1,6 +1,8 @@
 import dataclasses
+import functools
 
 import einops
+import numpy as np
 from openpi.models.pi0 import Pi0, Pi0Config, make_attn_mask
 import openpi.shared.nnx_utils as nnx_utils
 from openpi.models import model as _model
@@ -13,13 +15,55 @@ import jax.numpy as jnp
 
 from openpi.models.dit import DiffusionTransformer
 
+import torch
+from diffusers import AutoencoderKL, FlaxAutoencoderKL
+
+
+def _encode_images_with_vae_impl(images_np: np.ndarray) -> np.ndarray:
+    """
+    Pure Python/PyTorch function to encode images with VAE.
+    This runs outside of JAX tracing.
+    """
+    vae = get_vae()
+
+    # Normalize to [0, 1] if needed
+    if images_np.max() > 1.0:
+        images_np = images_np / 255.0
+
+    # Convert to PyTorch format: (B, C, H, W) and normalize to [-1, 1]
+    images_pt = torch.from_numpy(images_np).permute(0, 3, 1, 2).float()
+    images_pt = images_pt * 2 - 1
+
+    images_pt = images_pt.to(vae.device, dtype=torch.float16)
+
+    with torch.no_grad():
+        latent_dist = vae.encode(images_pt)
+        latents = latent_dist.latent_dist.sample()
+        latents = latents * vae.config.scaling_factor
+
+    latents_np = latents.float().cpu().numpy()
+
+    return latents_np
+
+
+@functools.lru_cache(maxsize=1)
+def get_vae():
+    """Load SD VAE as a singleton (not stored in model)."""
+    vae = AutoencoderKL.from_pretrained(
+        "stabilityai/sd-vae-ft-mse", torch_dtype=torch.float16
+    )
+    if torch.cuda.is_available():
+        vae = vae.to("cuda")
+    vae.eval()
+    return vae
+
 
 @dataclasses.dataclass(frozen=True)
 class Pi0PredictorConfig(Pi0Config):
-    in_channel: int = 2048
+    in_channel: int = 784
     hidden_size: int = 1024
     num_heads: int = 8
-    num_layers: int = 12
+    num_layers: int = 6
     freq_dim: int = 256
     video_depth: int = 6
     eps: float = 1e-5
@@ -64,9 +108,14 @@ class Pi0Predictor(Pi0):
         self._horizon = config.horizon  # This is 'k' (prediction length)
         self._history_len = config.history_len  # This is 'h' (history length)
         self._num_denoise_steps = config.num_denoise_steps
-        self._baseline_embedding = nnx.Variable(jnp.load(config.baseline_embedding_path))
+        self._baseline_embedding = nnx.Variable(
+            jnp.load(config.baseline_embedding_path)
+        )
         self._goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
         self._alpha = config.alpha
+        # self._vae, self._vae_params = FlaxAutoencoderKL.from_pretrained(
+        #     "stabilityai/sd-vae-ft-mse", from_pt=True
+        # )
 
         self._diffusion_transformer = DiffusionTransformer(
             in_channel=config.in_channel,
@@ -79,17 +128,49 @@ class Pi0Predictor(Pi0):
             rngs=rngs,
         )
 
-    def add_noise(
-        self, x: at.Array, noise: at.Array, timestep: at.Array, c: at.Array
-    ) -> at.Array:
-        time = timestep.reshape(c.shape[0], *((1,) * (len(c.shape) - 1)))
-        x_noisy = x + c * time + time * noise
-        return x_noisy
+    def _encode_with_vae(self, images: jnp.ndarray) -> jnp.ndarray:
+        """Encode images using SD VAE via pure_callback."""
+        has_time_dim = images.ndim == 5
+        if has_time_dim:
+            b, t, h, w, c = images.shape
+            images_flat = images.reshape(b * t, h, w, c)
+        else:
+            b, h, w, c = images.shape
+            images_flat = images
+            t = None
+
+        latent_h, latent_w = h // 8, w // 8
+        latent_c = 4
+        output_shape = jax.ShapeDtypeStruct(
+            (images_flat.shape[0], latent_c, latent_h, latent_w), jnp.float32
+        )
+
+        def callback_fn(imgs):
+            return _encode_images_with_vae_impl(np.asarray(imgs))
+
+        latents = jax.pure_callback(
+            callback_fn,
+            output_shape,
+            images_flat,
+        )
+
+        # latents = jnp.asarray(latents)
+
+        return latents
+
+    # def embed_inputs(
+    #     self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
+    # ) -> at.Float[at.Array, "*b s emb"]:
+    #     images = observation.images[self._image_key]
+    #     print("Embedding images with shape:", images.shape)
+    #     return self.PaliGemma.img(observation.images[self._image_key], train=False)[0]
 
     def embed_inputs(
         self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
     ) -> at.Float[at.Array, "*b s emb"]:
-        return self.PaliGemma.img(observation.images[self._image_key], train=False)[0]
+        """Encode images using SD VAE instead of PaliGemma."""
+        images = observation.images[self._image_key]
+        return self._encode_with_vae(images)
 
     @override
     def compute_loss(
@@ -106,12 +187,16 @@ class Pi0Predictor(Pi0):
         # Calculate how many full windows fit in the sequence
         num_windows = (t - h_len) // f_len
         if num_windows < 1:
-            raise ValueError(f"Insufficient sequence length {t} for H={h_len}, F={f_len}")
+            raise ValueError(
+                f"Insufficient sequence length {t} for H={h_len}, F={f_len}"
+            )
 
         # Embed observations (B, T, ...)
-        obs_p = _model.preprocess_observation(rng, observation, train=train, image_keys=list(observation.images.keys()))
-        embeddings = self.embed_inputs(obs_p, train=train, rng=rng) # (B, T, S, P)
-        embeddings = jnp.reshape(embeddings, (b, t, -1, embeddings.shape[-1]))
+        obs_p = _model.preprocess_observation(
+            rng, observation, train=train, image_keys=list(observation.images.keys())
+        )
+        embeddings = self.embed_inputs(obs_p, train=train, rng=rng)
+        embeddings = jnp.reshape(embeddings, (b, t, embeddings.shape[1], -1))
 
         # We slice out the Initial History and the Future Targets/Actions
         # init_history: (B, h_len, N, C)
@@ -132,13 +217,12 @@ class Pi0Predictor(Pi0):
             target_window, action_window = inputs
             B = target_window.shape[0]
 
-            # x_prior = curr_history[:, -1:, :, :]
             a_tokens = self.action_in_proj(action_window)
 
             rng, r_noise = jax.random.split(rng)
             noise = jax.random.normal(r_noise, target_window.shape)
 
-            target_residual = target_window - noise * self._eps
+            target_residual = target_window - noise
 
             timestep = jax.random.uniform(rng, (B,), minval=0.02, maxval=0.98)
             x_t = target_window + noise * timestep[:, None, None, None]
@@ -146,24 +230,9 @@ class Pi0Predictor(Pi0):
             v_pred = self._diffusion_transformer(x_t, curr_history, a_tokens, timestep)
             loss = jnp.mean(jnp.square(v_pred - target_residual))
 
-            # dt = -1.0 / self._num_denoise_steps
-            # for step in range(self._num_denoise_steps):
-            #     time = 1.0 + step * dt
-            #     timestep = jnp.full((B,), time)
-            #     v_pred = self._diffusion_transformer(x_t, curr_history, a_tokens, timestep)
-            #     x_t = x_t + dt * v_pred
-
-            # Loss on final prediction
-            # loss = jnp.mean((x_t - target_residual) ** 2)
-
-            # Use prediction for next history (matches inference)
-            # pred_data = x_prior + x_t
-            # next_history = jnp.concatenate([curr_history[:, f_len:], pred_data], axis=1)
-
             return (curr_history, rng), loss
 
         # Iterate over the reshaped windows
-        print(f"Computing loss over {num_windows} windows.")
         init_carry = (init_history, rng)
         _, losses = jax.lax.scan(scan_step, init_carry, (targets, act_seq))
 
@@ -182,13 +251,17 @@ class Pi0Predictor(Pi0):
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        noise = jax.random.normal(
+            rng, (batch_size, self.action_horizon, self.action_dim)
+        )
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
         def step(carry):
             x_t, time = carry
@@ -200,20 +273,31 @@ class Pi0Predictor(Pi0):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
             # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            full_attn_mask = jnp.concatenate(
+                [prefix_attn_mask, suffix_attn_mask], axis=-1
+            )
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens], mask=full_attn_mask, positions=positions, kv_cache=kv_cache
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -279,16 +363,20 @@ class Pi0Predictor(Pi0):
         num_steps = (t - h_len) // f_len
 
         if num_steps < 1:
-            raise ValueError(f"Insufficient sequence length {t} for history {h_len} and horizon {f_len}.")
+            raise ValueError(
+                f"Insufficient sequence length {t} for history {h_len} and horizon {f_len}."
+            )
 
         # Preprocess and embed observations
         observation = _model.preprocess_observation(
             rng, observation, train=train, image_keys=list(observation.images.keys())
         )
-        image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
-        image_embeddings = jnp.reshape(image_embeddings, (b, t, -1, image_embeddings.shape[-1]))
+        # embed_inputs returns (B*T, C, latent_h, latent_w)
+        embeddings = self.embed_inputs(observation, train=train, rng=rng)
 
-        N, C = image_embeddings.shape[2], image_embeddings.shape[3]
+        embeddings = jnp.reshape(embeddings, (b, t, embeddings.shape[1], -1))
+
+        N, C = embeddings.shape[2], embeddings.shape[3]
 
         def denoise_step(x_t, time, history, action_tokens):
             """Single denoising step."""
@@ -313,12 +401,11 @@ class Pi0Predictor(Pi0):
             def cond(carry):
                 _, time = carry
                 return time >= 0.5 / self._num_denoise_steps
+
             x_0, _ = jax.lax.while_loop(cond, denoise_loop, (noise, 1.0))
 
-            # x_0 is the predicted residual, add to prior
-            x_prior = history[:, -1:, :, :]
-            predictions = x_prior + x_0
-            return predictions.astype(history.dtype)
+            # x_0 is the predicted frames
+            return x_0.astype(history.dtype)
 
         def scan_step(carry, step_idx):
             """Rollout step for scan."""
@@ -326,34 +413,136 @@ class Pi0Predictor(Pi0):
             rng, step_rng = jax.random.split(rng)
 
             start_idx = h_len + step_idx * f_len
-            step_actions = jax.lax.dynamic_slice(actions, [0, start_idx, 0], [b, f_len, actions.shape[2]])
+            step_actions = jax.lax.dynamic_slice(
+                actions, [0, start_idx, 0], [b, f_len, actions.shape[2]]
+            )
 
             predictions = predict_window(history, step_actions, step_rng)
 
             # Slide history: drop oldest f_len, append predictions
-            # next_history = jnp.concatenate([history[:, f_len:], predictions], axis=1)
+            next_history = jnp.concatenate([history[:, f_len:], predictions], axis=1)
 
-            return (predictions, rng), predictions
+            return (next_history, rng), predictions
 
         # Run all prediction steps via scan
-        init_history = image_embeddings[:, :h_len]
-        _, all_preds = jax.lax.scan(scan_step, (init_history, rng), jnp.arange(num_steps))
-
+        init_history = embeddings[:, :h_len]
+        _, all_preds = jax.lax.scan(
+            scan_step, (init_history, rng), jnp.arange(num_steps)
+        )
+        
         # Reshape: (num_steps, b, f_len, s, p) -> (b, num_steps * f_len, s, p)
         all_preds = einops.rearrange(all_preds, "n b t s p -> b (n t) s p")
-        # all_predictions = jnp.concatenate([init_history, all_preds], axis=1)
-        all_predictions = all_preds
+        return all_preds
 
-        # Compute fused embeddings for all timesteps
-        def compute_fused_for_timestep(img_tokens):
-            return self.get_fused_embedding(img_tokens, observation)
+        # # Compute fused embeddings for all timesteps
+        # def compute_fused_for_timestep(img_tokens):
+        #     return self.get_fused_embedding(img_tokens, observation)
 
-        batch_fused_fn = jax.vmap(compute_fused_for_timestep, in_axes=1, out_axes=1)
+        # batch_fused_fn = jax.vmap(compute_fused_for_timestep, in_axes=1, out_axes=1)
 
-        past_fused_embeddings = batch_fused_fn(init_history)
-        future_fused_embeddings = batch_fused_fn(all_predictions)
+        # past_fused_embeddings = batch_fused_fn(init_history)
+        # future_fused_embeddings = batch_fused_fn(all_preds)
 
-        return past_fused_embeddings, future_fused_embeddings
+        # return past_fused_embeddings, future_fused_embeddings
+
+    # def predict_future(
+    #     self,
+    #     rng: at.KeyArrayLike,
+    #     observation: _model.Observation,
+    #     actions: _model.Actions,
+    #     *,
+    #     train: bool = False,
+    # ):
+    #     b, t, _ = actions.shape
+    #     h_len = self._history_len
+    #     f_len = self._horizon
+    #     num_steps = (t - h_len) // f_len
+
+    #     if num_steps < 1:
+    #         raise ValueError(
+    #             f"Insufficient sequence length {t} for history {h_len} and horizon {f_len}."
+    #         )
+
+    #     # Preprocess and embed observations
+    #     observation = _model.preprocess_observation(
+    #         rng, observation, train=train, image_keys=list(observation.images.keys())
+    #     )
+    #     image_embeddings = self.embed_inputs(observation, train=train, rng=rng)
+    #     embeddings = jnp.reshape(
+    #         image_embeddings, (b, t, image_embeddings.shape[1], -1)
+    #     )
+
+    #     N, C = image_embeddings.shape[2], image_embeddings.shape[3]
+
+    #     def denoise_step(x_t, time, history, action_tokens):
+    #         """Single denoising step."""
+    #         dt = -1.0 / self._num_denoise_steps
+    #         timestep = jnp.full((b,), time)
+    #         v_pred = self._diffusion_transformer(x_t, history, action_tokens, timestep)
+    #         return x_t + dt * v_pred
+
+    #     def predict_window(history, future_actions, rng):
+    #         """Predict next f_len frames using iterative denoising."""
+    #         action_tokens = self.action_in_proj(future_actions)
+
+    #         # Start from pure noise (t=1)
+    #         noise = jax.random.normal(rng, (b, f_len, N, C))
+
+    #         # Iteratively denoise from t=1 to t=0
+    #         def denoise_loop(carry):
+    #             x_t, time = carry
+    #             x_next = denoise_step(x_t, time, history, action_tokens)
+    #             return x_next, time - 1.0 / self._num_denoise_steps
+
+    #         def cond(carry):
+    #             _, time = carry
+    #             return time >= 0.5 / self._num_denoise_steps
+
+    #         x_0, _ = jax.lax.while_loop(cond, denoise_loop, (noise, 1.0))
+
+    #         # x_0 is the predicted residual, add to prior
+    #         x_prior = history[:, -1:, :, :]
+    #         predictions = x_prior + x_0
+    #         return predictions.astype(history.dtype)
+
+    #     def scan_step(carry, step_idx):
+    #         """Rollout step for scan."""
+    #         history, rng = carry
+    #         rng, step_rng = jax.random.split(rng)
+
+    #         start_idx = h_len + step_idx * f_len
+    #         step_actions = jax.lax.dynamic_slice(
+    #             actions, [0, start_idx, 0], [b, f_len, actions.shape[2]]
+    #         )
+
+    #         predictions = predict_window(history, step_actions, step_rng)
+
+    #         # Slide history: drop oldest f_len, append predictions
+    #         # next_history = jnp.concatenate([history[:, f_len:], predictions], axis=1)
+
+    #         return (predictions, rng), predictions
+
+    #     # Run all prediction steps via scan
+    #     init_history = image_embeddings[:, :h_len]
+    #     _, all_preds = jax.lax.scan(
+    #         scan_step, (init_history, rng), jnp.arange(num_steps)
+    #     )
+
+    #     # Reshape: (num_steps, b, f_len, s, p) -> (b, num_steps * f_len, s, p)
+    #     all_preds = einops.rearrange(all_preds, "n b t s p -> b (n t) s p")
+    #     # all_predictions = jnp.concatenate([init_history, all_preds], axis=1)
+    #     all_predictions = all_preds
+
+    #     # Compute fused embeddings for all timesteps
+    #     def compute_fused_for_timestep(img_tokens):
+    #         return self.get_fused_embedding(img_tokens, observation)
+
+    #     batch_fused_fn = jax.vmap(compute_fused_for_timestep, in_axes=1, out_axes=1)
+
+    #     past_fused_embeddings = batch_fused_fn(init_history)
+    #     future_fused_embeddings = batch_fused_fn(all_predictions)
+
+    #     return past_fused_embeddings, future_fused_embeddings
 
     # def predict_future(
     #     self,
