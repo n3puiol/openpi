@@ -686,7 +686,7 @@ _CONFIGS = [
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
-        batch_size=4,
+        batch_size=1,
         ema_decay=None,
     ),
     TrainConfig(

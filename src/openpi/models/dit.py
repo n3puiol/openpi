@@ -117,57 +117,6 @@ class MLP(nnx.Module):
         return self.fc2(nnx.silu(self.fc1(x)))
 
 
-class MultiHeadAttention(nnx.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        *,
-        rngs: nnx.Rngs,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        assert dim % num_heads == 0
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.q = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.k = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.v = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.proj = nnx.Linear(dim, dim, rngs=rngs)
-        self.attn_drop = nnx.Dropout(attn_drop) if attn_drop > 0 else None
-        self.proj_drop = nnx.Dropout(proj_drop) if proj_drop > 0 else None
-
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        *,
-        mask: Optional[jnp.ndarray] = None,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> jnp.ndarray:
-        B, N, C = x.shape
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        attn = jnp.einsum("bhnd,bhmd->bhnm", q, k) * self.scale
-        if mask is not None:
-            attn = jnp.where(mask[:, None, :, :], attn, jnp.full_like(attn, -1e30))
-        attn = nnx.softmax(attn, axis=-1)
-        if self.attn_drop is not None:
-            attn = self.attn_drop(attn, rngs=rngs)
-        out = (
-            jnp.einsum("bhnm,bhmd->bhnd", attn, v)
-            .transpose(0, 2, 1, 3)
-            .reshape(B, N, C)
-        )
-        out = self.proj(out)
-        if self.proj_drop is not None:
-            out = self.proj_drop(out, rngs=rngs)
-        return out
-
-
 # -----------------------------------------------------------------------------
 # Embedders
 # -----------------------------------------------------------------------------
@@ -200,13 +149,13 @@ class TransformerBlock(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.norm1 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs)
-        self.attn = MultiHeadAttention(
-            dim,
-            num_heads,
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=dim,
+            qkv_features=dim,
+            out_features=dim,
+            decode=False,
             rngs=rngs,
-            qkv_bias=True,
-            attn_drop=dropout,
-            proj_drop=dropout,
         )
         self.norm2 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs)
         self.ffn = MLP(dim, int(dim * mlp_ratio), dim, rngs=rngs)
@@ -215,7 +164,7 @@ class TransformerBlock(nnx.Module):
     def __call__(
         self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None
     ) -> jnp.ndarray:
-        h = self.attn(self.norm1(x), rngs=rngs)
+        h = self.attn(self.norm1(x))
         if self.drop is not None:
             h = self.drop(h, rngs=rngs)
         x = x + h
@@ -270,15 +219,14 @@ class CrossAttention(nnx.Module):
         rngs: nnx.Rngs,
         qkv_bias: bool = True,
     ):
-        assert dim % num_heads == 0
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.q = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.k = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.v = nnx.Linear(dim, dim, use_bias=qkv_bias, rngs=rngs)
-        self.proj = nnx.Linear(dim, dim, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=dim,
+            qkv_features=dim,
+            out_features=dim,
+            decode=False,
+            rngs=rngs,
+        )
 
     def __call__(
         self,
@@ -288,37 +236,12 @@ class CrossAttention(nnx.Module):
         mask: Optional[jnp.ndarray] = None,
         rngs: Optional[nnx.Rngs] = None,
     ) -> jnp.ndarray:
-        B, Nq, C = x_q.shape
-        B2, Nk, C2 = x_kv.shape
-        # Standard Cross Attention Logic
-        q = (
-            self.q(x_q)
-            .reshape(B, Nq, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k = (
-            self.k(x_kv)
-            .reshape(B, Nk, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        v = (
-            self.v(x_kv)
-            .reshape(B, Nk, self.num_heads, self.head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-
-        attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
+        # nnx.MultiHeadAttention expects mask where True means masked (opposite of our convention)
+        # Convert our mask (True=allowed) to their format (True=masked)
+        attn_mask = None
         if mask is not None:
-            # Mask shape is expected to broadcast to [B, H, Nq, Nk]
-            # Where mask is False, set attention score to very small number.
-            attn = jnp.where(mask, attn, jnp.full_like(attn, -1e30))
-        attn = nnx.softmax(attn, axis=-1)
-        out = (
-            jnp.einsum("bhqk,bhkd->bhqd", attn, v)
-            .transpose(0, 2, 1, 3)
-            .reshape(B, Nq, C)
-        )
-        return self.proj(out)
+            attn_mask = ~mask
+        return self.attn(x_q, x_kv, mask=attn_mask)
 
 
 class AdaLNModulator(nnx.Module):
@@ -344,7 +267,14 @@ class DiTBlock(nnx.Module):
     ):
         self.norm1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
         self.norm3 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
-        self.self_attn = MultiHeadAttention(hidden_size, num_heads, rngs=rngs)
+        self.self_attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=hidden_size,
+            qkv_features=hidden_size,
+            out_features=hidden_size,
+            decode=False,
+            rngs=rngs,
+        )
         self.cross = CrossAttention(hidden_size, num_heads, rngs=rngs)
         self.mlp = MLP(hidden_size, int(hidden_size * 4.0), hidden_size, rngs=rngs)
         self.mod = AdaLNModulator(hidden_size, rngs=rngs)
@@ -379,7 +309,7 @@ class DiTBlock(nnx.Module):
 
             # modulate_spatial handles (B*T, C) -> (B*T, 1, C) broadcasting
             x_tmp = modulate_spatial(self.norm1(x_bt), s_msa, sc_msa)
-            y = self.self_attn(x_tmp, rngs=rngs)
+            y = self.self_attn(x_tmp)
 
             x_bt = x_bt + (1.0 + g_msa[:, None, :]) * y
             x_bt = x_bt + (1.0 + g_mlp[:, None, :]) * self.mlp(
@@ -400,7 +330,7 @@ class DiTBlock(nnx.Module):
 
             # modulate_temporal now handles (B*N, C) -> (B*N, 1, C) broadcasting
             x_tmp = modulate_temporal(self.norm1(x_bn), s_msa, sc_msa)
-            y = self.self_attn(x_tmp, rngs=rngs)
+            y = self.self_attn(x_tmp)
 
             # Apply gating with explicit broadcasting
             x_bn = x_bn + (1.0 + g_msa[:, None, :]) * y
@@ -439,11 +369,14 @@ class DiffusionTransformer(nnx.Module):
         # Input Embedders
         self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
         self.time_encoder = TimestepEmbedder(hidden_size, freq_dim=freq_dim, rngs=rngs)
-        self.action_embedder = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.action_embedder = nnx.Linear(32, hidden_size, rngs=rngs)
 
-        # Context Encoders (LaDi-WM treats these as inputs to the denoising func)
         self.video_encoder = VideoTransformer(
-            in_channel=in_channel, dim=hidden_size, depth=video_depth, num_heads=num_heads, rngs=rngs
+            in_channel=in_channel,
+            dim=hidden_size,
+            depth=video_depth,
+            num_heads=num_heads,
+            rngs=rngs,
         )
 
         # Blocks
