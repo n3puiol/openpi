@@ -1,6 +1,5 @@
 from typing import Tuple, Optional
 
-import jax
 import jax.numpy as jnp
 from flax import nnx
 
@@ -83,23 +82,21 @@ def make_block_causal_mask(T: int, N: int) -> jnp.ndarray:
     return full_mask[None, None, :, :]
 
 
-def modulate_spatial(
-    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
-) -> jnp.ndarray:
-    """AdaLN: x * (1 + scale) + shift; broadcast over sequence (middle) dimension."""
-    # x: (Batch, Seq, Dim), shift/scale: (Batch, Dim) -> (Batch, 1, Dim)
-    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
-
-
-def modulate_temporal(
-    x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray
-) -> jnp.ndarray:
+def modulate(x: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
     """
-    AdaLN variant aligned to x's shape (temporal per-token).
-    x is (Batch*N, T, C). shift/scale are (Batch*N, C).
-    We must broadcast shift/scale over T.
+    AdaLN modulation:  x * (1 + scale) + shift.
+
+    Broadcasts shift/scale over the sequence (middle) dimension.
+
+    Args:
+        x: Input tensor of shape (Batch, Seq, Dim)
+        shift:  Shift tensor of shape (Batch, Dim)
+        scale: Scale tensor of shape (Batch, Dim)
+
+    Returns:
+        Modulated tensor of shape (Batch, Seq, Dim)
     """
-    # FIX: Added [:, None, :] to broadcast (Batch, Dim) -> (Batch, 1, Dim)
+    # (Batch, Dim) -> (Batch, 1, Dim) for broadcasting over Seq dimension
     return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
 
 
@@ -217,7 +214,6 @@ class CrossAttention(nnx.Module):
         num_heads: int,
         *,
         rngs: nnx.Rngs,
-        qkv_bias: bool = True,
     ):
         self.attn = nnx.MultiHeadAttention(
             num_heads=num_heads,
@@ -308,12 +304,12 @@ class DiTBlock(nnx.Module):
             s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bt)
 
             # modulate_spatial handles (B*T, C) -> (B*T, 1, C) broadcasting
-            x_tmp = modulate_spatial(self.norm1(x_bt), s_msa, sc_msa)
+            x_tmp = modulate(self.norm1(x_bt), s_msa, sc_msa)
             y = self.self_attn(x_tmp)
 
             x_bt = x_bt + (1.0 + g_msa[:, None, :]) * y
             x_bt = x_bt + (1.0 + g_mlp[:, None, :]) * self.mlp(
-                modulate_spatial(self.norm3(x_bt), s_mlp, sc_mlp)
+                modulate(self.norm3(x_bt), s_mlp, sc_mlp)
             )
 
             # Reshape back: (B*T, N, C) -> (B, T, N, C)
@@ -329,13 +325,13 @@ class DiTBlock(nnx.Module):
             s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp = self.mod(t_bn)
 
             # modulate_temporal now handles (B*N, C) -> (B*N, 1, C) broadcasting
-            x_tmp = modulate_temporal(self.norm1(x_bn), s_msa, sc_msa)
+            x_tmp = modulate(self.norm1(x_bn), s_msa, sc_msa)
             y = self.self_attn(x_tmp)
 
             # Apply gating with explicit broadcasting
             x_bn = x_bn + (1.0 + g_msa[:, None, :]) * y
             x_bn = x_bn + (1.0 + g_mlp[:, None, :]) * self.mlp(
-                modulate_temporal(self.norm3(x_bn), s_mlp, sc_mlp)
+                modulate(self.norm3(x_bn), s_mlp, sc_mlp)
             )
 
             # Reshape back: (B*N, T, C) -> (B, N, T, C) -> (B, T, N, C)
@@ -350,7 +346,6 @@ class DiTBlock(nnx.Module):
 
 
 class DiffusionTransformer(nnx.Module):
-
     def __init__(
         self,
         in_channel: int,
