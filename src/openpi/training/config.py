@@ -218,6 +218,17 @@ class FakeDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class SSV2DataConfig(DataConfigFactory):
+    repo_id: str = "jxie/something_something_v2"
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        return DataConfig(repo_id=self.repo_id)
+
+
+@dataclasses.dataclass(frozen=True)
 class SimpleDataConfig(DataConfigFactory):
     # Factory for the data transforms.
     data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(
@@ -654,6 +665,27 @@ _CONFIGS = [
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_ssv2_predictor",
+        project_name="openpi_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_horizon=10,
+        ),
+        data=SSV2DataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_libero/params"
+        ),
+        num_train_steps=40_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000, peak_lr=3e-5, decay_steps=40_000, decay_lr=1e-6
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+        ),
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=1,
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_libero_predictor",

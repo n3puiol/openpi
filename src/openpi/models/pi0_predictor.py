@@ -1,7 +1,6 @@
 import dataclasses
 
 import numpy as np
-from openpi.models.pi0 import Pi0, Pi0Config, make_attn_mask
 import openpi.shared.nnx_utils as nnx_utils
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
@@ -11,12 +10,13 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-from openpi.models.dit import DiffusionTransformer
+from openpi.models.dit import DiffusionTransformer, VideoTransformer
 from diffusers import FlaxAutoencoderKL
 
 
+# class Pi0PredictorConfig(Pi0Config):
 @dataclasses.dataclass(frozen=True)
-class Pi0PredictorConfig(Pi0Config):
+class Pi0PredictorConfig(_model.BaseModelConfig):
     in_channel: int = 4
     hidden_size: int = 1024
     num_heads: int = 8
@@ -27,16 +27,42 @@ class Pi0PredictorConfig(Pi0Config):
     image_key: str = "base_0_rgb"
     horizon: int = 5
     history_len: int = 5
-    num_denoise_steps: int = 6
+    num_denoise_steps: int = 12
+    pretrain: bool = True
+    
+    action_dim: int = 32
+    action_horizon: int = 10
+    max_token_len: int = 48
 
     # Reward estimation embeddings
-    baseline_embedding_path: str = (
-        "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
-    )
-    goal_embedding_path: str = (
-        "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
-    )
+    # baseline_embedding_path: str = (
+    #     "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
+    # )
+    # goal_embedding_path: str = (
+    #     "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
+    # )
     alpha: float = 0.5  # blending factor for regularized reward
+    
+    @override
+    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        with at.disable_typechecking():
+            observation_spec = _model.Observation(
+                images={
+                    "base_0_rgb": image_spec,
+                },
+                image_masks={
+                    "base_0_rgb": image_mask_spec,
+                },
+                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+            )
+        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+
+        return observation_spec, action_spec
 
     @property
     @override
@@ -50,27 +76,39 @@ class Pi0PredictorConfig(Pi0Config):
         rngs = nnx.Rngs(params=k_params, dropout=k_dropout)
         return Pi0Predictor(self, rngs=rngs)
 
-    @override
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        """Returns the freeze filter based on the model config."""
-        # This will automatically freeze the VAE params as they are not matched by this regex
-        return nnx.Not(nnx_utils.PathRegex("_diffusion_transformer.*"))
+        """Returns a filter selecting params to freeze.
+
+        We want to TRAIN only:
+          - _diffusion_transformer
+          - _action_embedder
+          - _video_encoder
+
+        So we FREEZE everything else: Not(Any(trainable_filters)).
+        """
+        dit_filter = nnx_utils.PathRegex("_diffusion_transformer.*")
+        ae_filter = nnx_utils.PathRegex("_action_embedder.*")
+        ve_filter = nnx_utils.PathRegex("_video_encoder.*")
+        trainable = nnx.Any(dit_filter, ae_filter, ve_filter)
+        return nnx.Not(trainable)
 
 
-class Pi0Predictor(Pi0):
+# class Pi0Predictor(Pi0):
+class Pi0Predictor(_model.BaseModel):
     def __init__(self, config: Pi0PredictorConfig, rngs: nnx.Rngs):
-        super().__init__(config, rngs)
-
+        super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self._eps = config.eps
         self._image_key = config.image_key
         self._horizon = config.horizon
         self._history_len = config.history_len
         self._num_denoise_steps = config.num_denoise_steps
-        self._baseline_embedding = nnx.Variable(
-            jnp.load(config.baseline_embedding_path)
-        )
-        self._goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
+        # self._baseline_embedding = nnx.Variable(
+        #     jnp.load(config.baseline_embedding_path)
+        # )
+        # self._goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
         self._alpha = config.alpha
+
+        self._pretrain = config.pretrain
 
         vae, vae_params = FlaxAutoencoderKL.from_pretrained(
             "stabilityai/sd-vae-ft-mse", from_pt=True, dtype=jnp.float32
@@ -79,14 +117,19 @@ class Pi0Predictor(Pi0):
         self._vae_params = jax.tree_util.tree_map(lambda x: nnx.Param(x), vae_params)
         self._vae_scaling_factor = vae.config.scaling_factor
 
+        self._video_encoder = VideoTransformer(
+            in_channel=config.in_channel,
+            dim=config.hidden_size,
+            depth=config.video_depth,
+            num_heads=config.num_heads,
+            rngs=rngs,
+        )
+        self._action_embedder = nnx.Linear(32, config.hidden_size, rngs=rngs)
         self._diffusion_transformer = DiffusionTransformer(
             in_channel=config.in_channel,
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             n_layers=config.num_layers,
-            freq_dim=config.freq_dim,
-            video_depth=config.video_depth,
-            epsilon=config.eps,
             rngs=rngs,
         )
 
@@ -121,15 +164,8 @@ class Pi0Predictor(Pi0):
         actions: _model.Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> at.Float[at.Array, "*b"]:
         b, t, _ = actions.shape
-        h_len, f_len = self._history_len, self._horizon
-
-        num_windows = (t - h_len) // f_len
-        if num_windows < 1:
-            raise ValueError(
-                f"Insufficient sequence length {t} for H={h_len}, F={f_len}"
-            )
 
         # Preprocess and embed observations
         rng, rng_preprocess, rng_embed = jax.random.split(rng, 3)
@@ -142,61 +178,128 @@ class Pi0Predictor(Pi0):
         embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
         embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
 
-        # Extract initial history
-        init_history = embeddings[:, :h_len]
+        history = embeddings[:, : self._history_len]
+        future = embeddings[:, self._history_len :]
+        history_features = self._video_encoder(history)
 
-        # Prepare windows for scan:  (num_windows, B, f_len, ...)
-        valid_len = num_windows * f_len
-        targets = embeddings[:, h_len : h_len + valid_len]
-        targets = targets.reshape(b, num_windows, f_len, *targets.shape[2:])
-        targets = jnp.transpose(
-            targets, (1, 0, 2, 3, 4)
-        )  # (num_windows, B, f_len, N, C)
+        if not self._pretrain:
+            action_window = actions[:, self._history_len :]
+            action_features = self._action_embedder(action_window)
+        else:
+            action_features = None
 
-        act_seq = actions[:, h_len : h_len + valid_len]
-        act_seq = act_seq.reshape(b, num_windows, f_len, -1)
-        act_seq = jnp.transpose(
-            act_seq, (1, 0, 2, 3)
-        )  # (num_windows, B, f_len, action_dim)
+        rng, rng_noise, rng_t = jax.random.split(rng, 3)
+        noise = jax.random.normal(rng_noise, future.shape)
+        timestep = jax.random.uniform(rng_t, (b,), minval=0.02, maxval=0.98)
 
-        def scan_step(carry, inputs):
-            curr_history, step_rng = carry
-            target_window, action_window = inputs
-            batch_size = target_window.shape[0]
+        t = timestep[:, None, None, None]
+        x_t = (1 - t) * noise + t * future
+        target_velocity = future - noise
 
-            # Split RNG properly for noise and timestep
-            step_rng, rng_noise, rng_time = jax.random.split(step_rng, 3)
+        v_pred = self._diffusion_transformer(
+            x_t,
+            history_features,
+            action_tokens=action_features,
+            timestep=timestep,
+        )
 
-            # Sample noise and timestep
-            noise = jax.random.normal(rng_noise, target_window.shape)
-            timestep = jax.random.uniform(
-                rng_time, (batch_size,), minval=0.02, maxval=0.98
-            )
+        loss = jnp.mean(jnp.square(v_pred - target_velocity))
+        return loss
 
-            # Flow matching interpolation:  x_t = (1-t)*x_0 + t*x_1
-            # where x_0 = noise, x_1 = target
-            t_broadcast = timestep[:, None, None, None]
-            x_t = (1.0 - t_broadcast) * noise + t_broadcast * target_window
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ) -> _model.Actions:
+        raise NotImplementedError("Action sampling not implemented for Pi0Predictor.")
 
-            # Target velocity: v = x_1 - x_0 = target - noise
-            target_velocity = target_window - noise
+    # @override
+    # def compute_loss(
+    #     self,
+    #     rng: at.KeyArrayLike,
+    #     observation: _model.Observation,
+    #     actions: _model.Actions,
+    #     *,
+    #     train: bool = False,
+    # ) -> at.Float[at.Array, "*b ah"]:
+    #     b, t, _ = actions.shape
+    #     h_len, f_len = self._history_len, self._horizon
 
-            # Predict velocity
-            v_pred = self._diffusion_transformer(
-                x_t, curr_history, action_window, timestep
-            )
+    #     num_windows = (t - h_len) // f_len
+    #     if num_windows < 1:
+    #         raise ValueError(
+    #             f"Insufficient sequence length {t} for H={h_len}, F={f_len}"
+    #         )
 
-            # MSE loss
-            loss = jnp.mean(jnp.square(v_pred - target_velocity))
+    #     # Preprocess and embed observations
+    #     rng, rng_preprocess, rng_embed = jax.random.split(rng, 3)
+    #     obs_p = _model.preprocess_observation(
+    #         rng_preprocess,
+    #         observation,
+    #         train=train,
+    #         image_keys=list(observation.images.keys()),
+    #     )
+    #     embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
+    #     embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
 
-            # Note: History stays fixed (parallel window training, not autoregressive)
-            # For autoregressive:  next_history = concat(curr_history[:, f_len:], target_window)
-            return (curr_history, step_rng), loss
+    #     # Extract initial history
+    #     init_history = embeddings[:, :h_len]
 
-        init_carry = (init_history, rng)
-        _, losses = jax.lax.scan(scan_step, init_carry, (targets, act_seq))
+    #     # Prepare windows for scan:  (num_windows, B, f_len, ...)
+    #     valid_len = num_windows * f_len
+    #     targets = embeddings[:, h_len : h_len + valid_len]
+    #     targets = targets.reshape(b, num_windows, f_len, *targets.shape[2:])
+    #     targets = jnp.transpose(
+    #         targets, (1, 0, 2, 3, 4)
+    #     )  # (num_windows, B, f_len, N, C)
 
-        return jnp.mean(losses)
+    #     act_seq = actions[:, h_len : h_len + valid_len]
+    #     act_seq = act_seq.reshape(b, num_windows, f_len, -1)
+    #     act_seq = jnp.transpose(
+    #         act_seq, (1, 0, 2, 3)
+    #     )  # (num_windows, B, f_len, action_dim)
+
+    #     def scan_step(carry, inputs):
+    #         curr_history, step_rng = carry
+    #         target_window, action_window = inputs
+    #         batch_size = target_window.shape[0]
+
+    #         # Split RNG properly for noise and timestep
+    #         step_rng, rng_noise, rng_time = jax.random.split(step_rng, 3)
+
+    #         # Sample noise and timestep
+    #         noise = jax.random.normal(rng_noise, target_window.shape)
+    #         timestep = jax.random.uniform(
+    #             rng_time, (batch_size,), minval=0.02, maxval=0.98
+    #         )
+
+    #         # Flow matching interpolation:  x_t = (1-t)*x_0 + t*x_1
+    #         # where x_0 = noise, x_1 = target
+    #         t_broadcast = timestep[:, None, None, None]
+    #         x_t = (1.0 - t_broadcast) * noise + t_broadcast * target_window
+
+    #         # Target velocity: v = x_1 - x_0 = target - noise
+    #         target_velocity = target_window - noise
+
+    #         # Predict velocity
+    #         v_pred = self._diffusion_transformer(
+    #             x_t, curr_history, action_window, timestep
+    #         )
+
+    #         # MSE loss
+    #         loss = jnp.mean(jnp.square(v_pred - target_velocity))
+
+    #         # Note: History stays fixed (parallel window training, not autoregressive)
+    #         # For autoregressive:  next_history = concat(curr_history[:, f_len:], target_window)
+    #         return (curr_history, step_rng), loss
+
+    #     init_carry = (init_history, rng)
+    #     _, losses = jax.lax.scan(scan_step, init_carry, (targets, act_seq))
+
+    #     return jnp.mean(losses)
 
     def _decode_with_vae(self, latents: jnp.ndarray) -> jnp.ndarray:
         """Decode latents back to images using the VAE decoder.
@@ -254,7 +357,6 @@ class Pi0Predictor(Pi0):
 
         return decoded
 
-
     def predict_future(
         self,
         rng: at.KeyArrayLike,
@@ -263,10 +365,12 @@ class Pi0Predictor(Pi0):
         *,
         decode_to_images: bool = False,
     ) -> jnp.ndarray:
-        """Predict future states using flow matching inference."""
+        """Predict future states using flow matching inference.
+
+        Uses Heun's method when num_denoise_steps >= 10, otherwise Euler.
+        """
         b, t, _ = actions.shape
 
-        # Preprocess and encode observations
         obs_p = _model.preprocess_observation(
             rng, observation, train=False, image_keys=list(observation.images.keys())
         )
@@ -276,44 +380,85 @@ class Pi0Predictor(Pi0):
 
         _, _, N, C = embeddings.shape
         history = embeddings[:, : self._history_len]
-        action_window = actions[:, self._history_len : self._history_len + self._horizon]
+        history_features = self._video_encoder(history)
 
-        # Initialize at t=0 with pure noise
+        if not self._pretrain:
+            action_window = actions[:, self._history_len : self._history_len + self._horizon]
+            action_features = self._action_embedder(action_window)
+        else:
+            action_features = None
+
         rng, rng_init = jax.random.split(rng)
         x_t = jax.random.normal(rng_init, (b, self._horizon, N, C))
 
-        # Integrate from t=0 to t=1 (noise → data)
         num_steps = self._num_denoise_steps
         step_size = 1.0 / num_steps
         timesteps = jnp.linspace(0.0, 1.0, num_steps, endpoint=False)
 
-        def denoise_step(x_curr, timestep):
+        # Choose solver based on num_denoise_steps
+        use_heun = num_steps >= 10
+
+        def euler_step(x_curr, timestep):
+            """First-order Euler integration."""
             t_batch = jnp.full((b,), timestep)
-            v_pred = self._diffusion_transformer(x_curr, history, action_window, t_batch)
-            x_next = x_curr + v_pred * step_size  # Euler step:  x += v * dt
+            v_pred = self._diffusion_transformer(
+                x_curr,
+                history_features,
+                action_tokens=action_features,
+                timestep=t_batch,
+            )
+            x_next = x_curr + v_pred * step_size
             return x_next, None
 
-        predicted_latents, _ = jax.lax.scan(denoise_step, x_t, timesteps)
+        def heun_step(x_curr, timestep):
+            """Second-order Heun (predictor-corrector) integration."""
+            t_batch = jnp.full((b,), timestep)
+            t_next_batch = jnp.full((b,), jnp.minimum(timestep + step_size, 1.0))
+
+            # Predictor:  Euler step
+            k1 = self._diffusion_transformer(
+                x_curr,
+                history_features,
+                action_tokens=action_features,
+                timestep=t_batch,
+            )
+            x_pred = x_curr + k1 * step_size
+
+            # Corrector: average slopes
+            k2 = self._diffusion_transformer(
+                x_pred,
+                history_features,
+                action_tokens=action_features,
+                timestep=t_next_batch,
+            )
+            x_next = x_curr + (k1 + k2) * (step_size / 2.0)
+
+            return x_next, None
+
+        # Select solver
+        step_fn = heun_step if use_heun else euler_step
+
+        predicted_latents, _ = jax.lax.scan(step_fn, x_t, timesteps)
 
         if decode_to_images:
             return self._decode_with_vae(predicted_latents)
         return predicted_latents
 
-    def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
-        s = state_embedding
-        g = self._goal_embedding.value
-        b = self._baseline_embedding.value
+    # def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
+    #     s = state_embedding
+    #     g = self._goal_embedding.value
+    #     b = self._baseline_embedding.value
 
-        direction_vector = g - b
-        direction_vector_norm_sq = jnp.sum(direction_vector**2)
+    #     direction_vector = g - b
+    #     direction_vector_norm_sq = jnp.sum(direction_vector**2)
 
-        s_minus_b = s - b
-        projection_scalar = jnp.dot(s_minus_b, direction_vector) / jnp.maximum(
-            direction_vector_norm_sq, 1e-6
-        )
-        projected_s = b + projection_scalar * direction_vector
+    #     s_minus_b = s - b
+    #     projection_scalar = jnp.dot(s_minus_b, direction_vector) / jnp.maximum(
+    #         direction_vector_norm_sq, 1e-6
+    #     )
+    #     projected_s = b + projection_scalar * direction_vector
 
-        blended_embedding = (1 - self._alpha) * s + self._alpha * projected_s
+    #     blended_embedding = (1 - self._alpha) * s + self._alpha * projected_s
 
-        reward = 1.0 - 0.5 * jnp.sum((blended_embedding - g) ** 2)
-        return reward
+    #     reward = 1.0 - 0.5 * jnp.sum((blended_embedding - g) ** 2)
+    #     return reward

@@ -339,100 +339,161 @@ class DiTBlock(nnx.Module):
 
         return x
 
-
-# -----------------------------------------------------------------------------
-# Main Diffusion Transformer
-# -----------------------------------------------------------------------------
+    # -----------------------------------------------------------------------------
+    # Main Diffusion Transformer
+    # -----------------------------------------------------------------------------
 
 
 class DiffusionTransformer(nnx.Module):
-    def __init__(
-        self,
-        in_channel: int,
-        hidden_size: int,
-        num_heads: int,
-        n_layers: int,
-        freq_dim: int,
-        video_depth: int,
-        epsilon: float,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.in_channel = in_channel
+    """DiT that can handle optional action conditioning."""
+    def __init__(self, in_channel, hidden_size, num_heads, n_layers, rngs):
         self.hidden_size = hidden_size
-
-        # Input Embedders
         self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
-        self.time_encoder = TimestepEmbedder(hidden_size, freq_dim=freq_dim, rngs=rngs)
-        self.action_embedder = nnx.Linear(32, hidden_size, rngs=rngs)
+        self.time_encoder = TimestepEmbedder(hidden_size, rngs=rngs)
 
-        self.video_encoder = VideoTransformer(
-            in_channel=in_channel,
-            dim=hidden_size,
-            depth=video_depth,
-            num_heads=num_heads,
-            rngs=rngs,
-        )
-
-        # Blocks
-        self.n_layers = n_layers
         self.blocks = nnx.Dict(
             {
                 f"block_{i}": DiTBlock(hidden_size, num_heads, rngs=rngs)
-                for i in range(self.n_layers)
+                for i in range(n_layers)
             }
         )
 
-        # Output Head
-        self.final_norm = nnx.LayerNorm(hidden_size, epsilon=epsilon, rngs=rngs)
+        self.final_norm = nnx.LayerNorm(hidden_size, rngs=rngs)
         self.final_linear = nnx.Linear(hidden_size, in_channel, rngs=rngs)
-
-        # Zero-init output for stability
         self.final_linear.kernel.value = jnp.zeros_like(self.final_linear.kernel.value)
 
     def __call__(
         self,
-        x_noisy: jnp.ndarray,
-        lc_his: jnp.ndarray,
-        action_tokens: jnp.ndarray,
-        time: jnp.ndarray,
-        *,
-        rngs: Optional[nnx.Rngs] = None,
-    ) -> jnp.ndarray:
-        B, T, N, Cin = x_noisy.shape
+        x_noisy,
+        history_features,
+        timestep,
+        action_tokens=None,  # Optional!
+    ):
+        B, T, N, C = x_noisy.shape
 
-        # Embed Noisy Input
-        x = self.x_embedder(x_noisy).reshape(B, T * N, self.hidden_size)
+        # Embed noisy input
+        x = self.x_embedder(x_noisy)
+        x = x.reshape(B, T * N, self.hidden_size)
         pos = get_2d_sincos_pos_embed(self.hidden_size, (T, N))
         x = x + pos
         x = x.reshape(B, T, N, self.hidden_size)
 
-        # Embed Time (AdaLN Driver)
-        t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Hidden_Size]
+        # Time embedding
+        t_fea = self.time_encoder(jnp.log(timestep + 1e-8))
 
-        # Embed Context (Cross-Attention Targets)
-        # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Hidden_Size]
-        v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Hidden_Size]
+        # Context:  history only, or history + actions
+        if action_tokens is not None:
+            context_fea = jnp.concatenate([history_features, action_tokens], axis=1)
+            ctx_mask = make_block_causal_mask(T, history_features.shape[1])
+        else:
+            # No actions - just use history
+            context_fea = history_features
+            ctx_mask = None  # Full attention to all history tokens
 
-        a_fea = self.action_embedder(action_tokens)  # [B, T, Hidden_Size]
-
-        context_fea = jnp.concatenate([v_fea, a_fea], axis=1)
-
-        ctx_mask = make_block_causal_mask(T, N)
-
-        for i in range(self.n_layers):
+        # Transformer blocks
+        for i, (_, block) in enumerate(self.blocks.items()):
             mode = "spatial" if i % 2 == 0 else "temporal"
-            x = self.blocks[f"block_{i}"](
+            x = block(
                 x,
                 t_fea=t_fea,
                 context_fea=context_fea,
-                shape=(B, T, N, Cin),
+                shape=(B, T, N, C),
                 block_type=mode,
                 context_mask=ctx_mask,
-                rngs=rngs,
             )
 
         x = self.final_norm(x)
-        y_pred = self.final_linear(x)
+        return self.final_linear(x)
 
-        return y_pred
+
+# class DiffusionTransformer(nnx.Module):
+# def __init__(
+#     self,
+#     in_channel: int,
+#     hidden_size: int,
+#     num_heads: int,
+#     n_layers: int,
+#     freq_dim: int,
+#     video_depth: int,
+#     epsilon: float,
+#     *,
+#     rngs: nnx.Rngs,
+# ):
+#     self.in_channel = in_channel
+#     self.hidden_size = hidden_size
+
+#     # Input Embedders
+#     self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
+#     self.time_encoder = TimestepEmbedder(hidden_size, freq_dim=freq_dim, rngs=rngs)
+#     self.action_embedder = nnx.Linear(32, hidden_size, rngs=rngs)
+
+#     self.video_encoder = VideoTransformer(
+#         in_channel=in_channel,
+#         dim=hidden_size,
+#         depth=video_depth,
+#         num_heads=num_heads,
+#         rngs=rngs,
+#     )
+
+#     # Blocks
+#     self.n_layers = n_layers
+#     self.blocks = nnx.Dict(
+#         {
+#             f"block_{i}": DiTBlock(hidden_size, num_heads, rngs=rngs)
+#             for i in range(self.n_layers)
+#         }
+#     )
+
+#     # Output Head
+#     self.final_norm = nnx.LayerNorm(hidden_size, epsilon=epsilon, rngs=rngs)
+#     self.final_linear = nnx.Linear(hidden_size, in_channel, rngs=rngs)
+
+#     # Zero-init output for stability
+#     self.final_linear.kernel.value = jnp.zeros_like(self.final_linear.kernel.value)
+
+# def __call__(
+#     self,
+#     x_noisy: jnp.ndarray,
+#     lc_his: jnp.ndarray,
+#     action_tokens: jnp.ndarray,
+#     time: jnp.ndarray,
+#     *,
+#     rngs: Optional[nnx.Rngs] = None,
+# ) -> jnp.ndarray:
+#     B, T, N, Cin = x_noisy.shape
+
+#     # Embed Noisy Input
+#     x = self.x_embedder(x_noisy).reshape(B, T * N, self.hidden_size)
+#     pos = get_2d_sincos_pos_embed(self.hidden_size, (T, N))
+#     x = x + pos
+#     x = x.reshape(B, T, N, self.hidden_size)
+
+#     # Embed Time (AdaLN Driver)
+#     t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Hidden_Size]
+
+#     # Embed Context (Cross-Attention Targets)
+#     # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Hidden_Size]
+#     v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Hidden_Size]
+
+#     a_fea = self.action_embedder(action_tokens)  # [B, T, Hidden_Size]
+
+#     context_fea = jnp.concatenate([v_fea, a_fea], axis=1)
+
+#     ctx_mask = make_block_causal_mask(T, N)
+
+#     for i in range(self.n_layers):
+#         mode = "spatial" if i % 2 == 0 else "temporal"
+#         x = self.blocks[f"block_{i}"](
+#             x,
+#             t_fea=t_fea,
+#             context_fea=context_fea,
+#             shape=(B, T, N, Cin),
+#             block_type=mode,
+#             context_mask=ctx_mask,
+#             rngs=rngs,
+#         )
+
+#     x = self.final_norm(x)
+#     y_pred = self.final_linear(x)
+
+#     return y_pred
