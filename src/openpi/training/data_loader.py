@@ -168,16 +168,6 @@ def create_torch_dataset(
         },
     )
 
-    # Split dataset into train and validation
-    # total_size = len(dataset)
-    # val_size = int(total_size * val_split)
-    # train_size = total_size - val_size
-
-    # if train:
-    #     dataset = torch.utils.data.Subset(dataset, range(train_size))
-    # else:
-    #     dataset = torch.utils.data.Subset(dataset, range(train_size, total_size))
-
     if data_config.prompt_from_task:
         dataset = TransformedDataset(
             dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
@@ -230,12 +220,15 @@ def _process_and_resize_video_jax(
         shape=(num_frames, resolution, resolution, C),
         method="bilinear",
     )
+    
+    resized = jnp.clip(resized / 127.5 - 1.0, -1.0, 1.0)
 
     return resized
 
 
 class SomethingSomethingV2Dataset(Dataset):
     """Something-Something V2 dataset using HuggingFace datasets."""
+
     def __init__(
         self,
         data_config: _config.DataConfig,
@@ -253,19 +246,8 @@ class SomethingSomethingV2Dataset(Dataset):
         self._observation_spec, self._action_spec = model_config.inputs_spec()
 
     def __getitem__(self, index: SupportsIndex) -> dict:
-        rng = jax.random.key(index.__index__())
-
         def make_from_spec(spec: jax.ShapeDtypeStruct):
-            nonlocal rng
-            rng, data_rng = jax.random.split(rng)
-            # Remove the batch dimension.
             shape = spec.shape[1:]
-            if spec.dtype == jnp.float32:
-                return jax.random.uniform(
-                    data_rng, shape=shape, minval=-1.0, maxval=1.0
-                )
-            if spec.dtype == jnp.int32:
-                return jax.random.randint(data_rng, shape=shape, minval=0, maxval=2048)
             return jnp.zeros(shape=shape, dtype=spec.dtype)
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
@@ -274,11 +256,11 @@ class SomethingSomethingV2Dataset(Dataset):
         observation_dict = observation.to_dict()
         item = self.dataset["train"][index]
         video_data = self._process_video(item["video"])
-        if video_data is not None:
-            observation_dict["image"]["base_0_rgb"] = video_data
-        else:
-            print(f"Skipping sample {index} due to insufficient frames.")
+        if video_data is None:
+            return self.__getitem__((index.__index__() + 1) % len(self))
+        
 
+        observation_dict["image"]["base_0_rgb"] = video_data
         return {
             **observation_dict,
             "actions": action,
@@ -296,7 +278,9 @@ class SomethingSomethingV2Dataset(Dataset):
 
         video_array = jnp.stack(frames, axis=0)
 
-        return _process_and_resize_video_jax(video_array, self.num_frames, self.resolution)
+        return _process_and_resize_video_jax(
+            video_array, self.num_frames, self.resolution
+        )
 
 
 def create_rlds_dataset(
@@ -382,10 +366,10 @@ def create_ssv2_dataloader(
 ) -> DataLoader:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
-    
+
     if data_config.repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create SSV2 data loader.")
-    
+
     dataset = SomethingSomethingV2Dataset(
         data_config,
         action_horizon=config.model.action_horizon,

@@ -861,15 +861,14 @@ def log_predicted_images(
 
     # Log predicted images to wandb
     images_to_log = []
-    for b in range(predicted_images.shape[0]):
-        horizon_frames = predicted_images[b]  # (horizon, H, W, C)
-        horizon_frames = (horizon_frames * 255).astype(np.uint8)
-        concat_frames = np.concatenate(
-            [horizon_frames[t] for t in range(horizon_frames.shape[0])], axis=1
-        )
-        images_to_log.append(
-            wandb.Image(concat_frames, caption=f"Step {step}: Predicted future frames")
-        )
+    horizon_frames = predicted_images[0]  # (horizon, H, W, C)
+    horizon_frames = (horizon_frames * 255).astype(np.uint8)
+    concat_frames = np.concatenate(
+        [horizon_frames[t] for t in range(horizon_frames.shape[0])], axis=1
+    )
+    images_to_log.append(
+        wandb.Image(concat_frames, caption=f"Step {step}: Predicted future frames")
+    )
 
     wandb.log({"predicted_future_images": images_to_log}, step=step)
 
@@ -919,10 +918,17 @@ def main(config: _config.TrainConfig):
     # Log images from first batch to sanity check.
     images_to_log = [
         wandb.Image(
-            np.array(batch[0].images["base_0_rgb"][0] * 255).astype(np.uint8),
+            np.concatenate(
+                [np.array(img[i]) for img in batch[0].images.values()], axis=1
+            )
         )
+        for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
+
+    # check min and max pixel values
+    sample_image = jax.device_get(batch[0].images["base_0_rgb"][0])
+    logging.info(f"Sample image pixel range: min={sample_image.min()}, max={sample_image.max()}")
 
     train_state, train_state_sharding = init_train_state(
         config, init_rng, mesh, resume=resuming
@@ -951,7 +957,7 @@ def main(config: _config.TrainConfig):
         total=config.num_train_steps,
         dynamic_ncols=True,
     )
-\
+
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):

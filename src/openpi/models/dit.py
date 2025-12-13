@@ -171,18 +171,65 @@ class TransformerBlock(nnx.Module):
         return x + h2
 
 
-class VideoTransformer(nnx.Module):
+# class VideoTransformer(nnx.Module):
+#     def __init__(
+#         self,
+#         in_channel: int,
+#         dim: int,
+#         depth: int = 8,
+#         num_heads: int = 8,
+#         *,
+#         rngs: nnx.Rngs,
+#     ):
+#         self.token = nnx.Param(jnp.zeros((1, 1, dim), dtype=jnp.float32))
+#         self.inp = nnx.Linear(in_channel, dim, rngs=rngs)
+#         self.blocks = nnx.Dict(
+#             {
+#                 f"block_{i}": TransformerBlock(
+#                     dim, num_heads, mlp_ratio=2.0, dropout=0.0, rngs=rngs
+#                 )
+#                 for i in range(depth)
+#             }
+#         )
+
+#     def __call__(
+#         self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None
+#     ) -> jnp.ndarray:
+#         # x: [B, T, N, Cin] -> [B, N, C]
+#         x = self.inp(x)
+#         B, T, N, C = x.shape
+#         x = x.reshape(B * N, T, C)
+#         cls = jnp.broadcast_to(self.token.value, (B * N, 1, C))
+#         x = jnp.concatenate([cls, x], axis=1)
+#         for _, block in self.blocks.items():
+#             x = block(x, rngs=rngs)
+#         g = x[:, 0, :]
+#         return g.reshape(B, N, C)
+
+
+class MultiViewVideoTransformer(nnx.Module):
+    """Video Transformer that handles multiple camera views with cross-attention."""
+
     def __init__(
         self,
         in_channel: int,
         dim: int,
         depth: int = 8,
         num_heads: int = 8,
+        num_cross_attn_layers: int = 2,  # Layers for cross-view attention
         *,
         rngs: nnx.Rngs,
     ):
         self.token = nnx.Param(jnp.zeros((1, 1, dim), dtype=jnp.float32))
         self.inp = nnx.Linear(in_channel, dim, rngs=rngs)
+
+        # Learnable view embeddings (will be expanded dynamically)
+        self.max_views = 8  # Maximum number of views supported
+        self.view_embeddings = nnx.Param(
+            jnp.zeros((self.max_views, 1, dim), dtype=jnp.float32)
+        )
+
+        # Self-attention blocks (within each view)
         self.blocks = nnx.Dict(
             {
                 f"block_{i}": TransformerBlock(
@@ -192,19 +239,119 @@ class VideoTransformer(nnx.Module):
             }
         )
 
+        # Cross-attention blocks (across views)
+        self.cross_view_layers = nnx.Dict(
+            {
+                f"cross_{i}": CrossViewAttentionBlock(dim, num_heads, rngs=rngs)
+                for i in range(num_cross_attn_layers)
+            }
+        )
+
+        self.dim = dim
+
     def __call__(
-        self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None
+        self,
+        views: list[jnp.ndarray],  # List of [B, T, N, Cin] tensors, one per view
+        *,
+        rngs: Optional[nnx.Rngs] = None,
     ) -> jnp.ndarray:
-        # x: [B, T, N, Cin] -> [B, N, C]
-        x = self.inp(x)
-        B, T, N, C = x.shape
-        x = x.reshape(B * N, T, C)
-        cls = jnp.broadcast_to(self.token.value, (B * N, 1, C))
-        x = jnp.concatenate([cls, x], axis=1)
-        for _, block in self.blocks.items():
-            x = block(x, rngs=rngs)
-        g = x[:, 0, :]
-        return g.reshape(B, N, C)
+        """
+        Process multiple views and return fused history features.
+
+        Args:
+            views: List of tensors, each of shape [B, T, N, Cin]
+                   where T is history length, N is spatial tokens, Cin is input channels
+
+        Returns:
+            Fused features of shape [B, N, C] for the primary view (first in list)
+        """
+        num_views = len(views)
+        if num_views == 0:
+            raise ValueError("At least one view must be provided")
+
+        B, T, N, Cin = views[0].shape
+
+        # Process each view through input projection
+        view_features = []
+        for v_idx, view in enumerate(views):
+            x = self.inp(view)  # [B, T, N, C]
+
+            # Add view-specific embedding
+            view_emb = self.view_embeddings.value[v_idx]  # [1, C]
+            x = x + view_emb[None, None, :, :]  # Broadcast to [B, T, N, C]
+
+            # Reshape for temporal processing:  [B*N, T, C]
+            x = x.reshape(B * N, T, -1)
+
+            # Add CLS token
+            cls = jnp.broadcast_to(self.token.value, (B * N, 1, self.dim))
+            x = jnp.concatenate([cls, x], axis=1)  # [B*N, T+1, C]
+
+            # Self-attention within this view
+            for _, block in self.blocks.items():
+                x = block(x, rngs=rngs)
+
+            # Extract CLS token as view summary:  [B*N, C] -> [B, N, C]
+            view_summary = x[:, 0, :].reshape(B, N, -1)
+            view_features.append(view_summary)
+
+        # If only one view, return directly
+        if num_views == 1:
+            return view_features[0]
+
+        # Stack views for cross-attention:  [B, num_views, N, C]
+        stacked = jnp.stack(view_features, axis=1)
+
+        # Apply cross-view attention
+        for _, cross_layer in self.cross_view_layers.items():
+            stacked = cross_layer(stacked, rngs=rngs)
+
+        # Return primary view features (first view, enriched with cross-view info)
+        return stacked[:, 0, :, :]  # [B, N, C]
+
+
+class CrossViewAttentionBlock(nnx.Module):
+    """Cross-attention block that allows views to attend to each other."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 2.0,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.norm1 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs)
+        self.cross_attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=dim,
+            qkv_features=dim,
+            out_features=dim,
+            decode=False,
+            rngs=rngs,
+        )
+        self.norm2 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs)
+        self.ffn = MLP(dim, int(dim * mlp_ratio), dim, rngs=rngs)
+
+    def __call__(
+        self, x: jnp.ndarray, *, rngs: Optional[nnx.Rngs] = None  # [B, num_views, N, C]
+    ) -> jnp.ndarray:
+        B, V, N, C = x.shape
+
+        # Reshape to process each spatial position across all views
+        # [B, V, N, C] -> [B*N, V, C]
+        x_flat = x.transpose(0, 2, 1, 3).reshape(B * N, V, C)
+
+        # Cross-attention: each view attends to all views
+        x_norm = self.norm1(x_flat)
+        attn_out = self.cross_attn(x_norm)
+        x_flat = x_flat + attn_out
+
+        # FFN
+        x_flat = x_flat + self.ffn(self.norm2(x_flat))
+
+        # Reshape back: [B*N, V, C] -> [B, V, N, C]
+        return x_flat.reshape(B, N, V, C).transpose(0, 2, 1, 3)
 
 
 class CrossAttention(nnx.Module):
@@ -339,13 +486,15 @@ class DiTBlock(nnx.Module):
 
         return x
 
-    # -----------------------------------------------------------------------------
-    # Main Diffusion Transformer
-    # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Main Diffusion Transformer
+# -----------------------------------------------------------------------------
 
 
 class DiffusionTransformer(nnx.Module):
     """DiT that can handle optional action conditioning."""
+
     def __init__(self, in_channel, hidden_size, num_heads, n_layers, rngs):
         self.hidden_size = hidden_size
         self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
@@ -404,96 +553,3 @@ class DiffusionTransformer(nnx.Module):
 
         x = self.final_norm(x)
         return self.final_linear(x)
-
-
-# class DiffusionTransformer(nnx.Module):
-# def __init__(
-#     self,
-#     in_channel: int,
-#     hidden_size: int,
-#     num_heads: int,
-#     n_layers: int,
-#     freq_dim: int,
-#     video_depth: int,
-#     epsilon: float,
-#     *,
-#     rngs: nnx.Rngs,
-# ):
-#     self.in_channel = in_channel
-#     self.hidden_size = hidden_size
-
-#     # Input Embedders
-#     self.x_embedder = nnx.Linear(in_channel, hidden_size, rngs=rngs)
-#     self.time_encoder = TimestepEmbedder(hidden_size, freq_dim=freq_dim, rngs=rngs)
-#     self.action_embedder = nnx.Linear(32, hidden_size, rngs=rngs)
-
-#     self.video_encoder = VideoTransformer(
-#         in_channel=in_channel,
-#         dim=hidden_size,
-#         depth=video_depth,
-#         num_heads=num_heads,
-#         rngs=rngs,
-#     )
-
-#     # Blocks
-#     self.n_layers = n_layers
-#     self.blocks = nnx.Dict(
-#         {
-#             f"block_{i}": DiTBlock(hidden_size, num_heads, rngs=rngs)
-#             for i in range(self.n_layers)
-#         }
-#     )
-
-#     # Output Head
-#     self.final_norm = nnx.LayerNorm(hidden_size, epsilon=epsilon, rngs=rngs)
-#     self.final_linear = nnx.Linear(hidden_size, in_channel, rngs=rngs)
-
-#     # Zero-init output for stability
-#     self.final_linear.kernel.value = jnp.zeros_like(self.final_linear.kernel.value)
-
-# def __call__(
-#     self,
-#     x_noisy: jnp.ndarray,
-#     lc_his: jnp.ndarray,
-#     action_tokens: jnp.ndarray,
-#     time: jnp.ndarray,
-#     *,
-#     rngs: Optional[nnx.Rngs] = None,
-# ) -> jnp.ndarray:
-#     B, T, N, Cin = x_noisy.shape
-
-#     # Embed Noisy Input
-#     x = self.x_embedder(x_noisy).reshape(B, T * N, self.hidden_size)
-#     pos = get_2d_sincos_pos_embed(self.hidden_size, (T, N))
-#     x = x + pos
-#     x = x.reshape(B, T, N, self.hidden_size)
-
-#     # Embed Time (AdaLN Driver)
-#     t_fea = self.time_encoder(jnp.log(time + 1e-8))  # [B, Hidden_Size]
-
-#     # Embed Context (Cross-Attention Targets)
-#     # History: [B, T_his, N, C] -> VideoTransformer -> [B, N, Hidden_Size]
-#     v_fea = self.video_encoder(lc_his, rngs=rngs)  # [B, N, Hidden_Size]
-
-#     a_fea = self.action_embedder(action_tokens)  # [B, T, Hidden_Size]
-
-#     context_fea = jnp.concatenate([v_fea, a_fea], axis=1)
-
-#     ctx_mask = make_block_causal_mask(T, N)
-
-#     for i in range(self.n_layers):
-#         mode = "spatial" if i % 2 == 0 else "temporal"
-#         x = self.blocks[f"block_{i}"](
-#             x,
-#             t_fea=t_fea,
-#             context_fea=context_fea,
-#             shape=(B, T, N, Cin),
-#             block_type=mode,
-#             context_mask=ctx_mask,
-#             rngs=rngs,
-#         )
-
-#     x = self.final_norm(x)
-#     y_pred = self.final_linear(x)
-
-#     return y_pred

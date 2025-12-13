@@ -671,11 +671,12 @@ _CONFIGS = [
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
             action_horizon=10,
+            pretrain=True,
         ),
         data=SSV2DataConfig(),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_libero/params"
-        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader(
+        #     "gs://openpi-assets/checkpoints/pi0_libero/params"
+        # ),
         num_train_steps=40_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2000, peak_lr=3e-5, decay_steps=40_000, decay_lr=1e-6
@@ -684,7 +685,7 @@ _CONFIGS = [
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
-        batch_size=1,
+        batch_size=2,
         ema_decay=None,
     ),
     TrainConfig(
@@ -692,24 +693,24 @@ _CONFIGS = [
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
             action_horizon=10,
+            pretrain=False,
+            ignore_image_keys=["right_wrist_0_rgb"],
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(
                 assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero/assets",
             ),
-            # assets=AssetsConfig(
-            #     assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero_predictor/assets",
-            # ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
-                action_sequence_keys=("actions", "image"),
+                action_sequence_keys=("actions", "image", "wrist_image"),
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_libero/params"
-        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader(
+        #     # "gs://openpi-assets/checkpoints/pi0_libero/params"
+        #     "/scratch/s5649552/openpi/checkpoints/pi0_ssv2_predictor/predictor_pretrain/39999/params"
+        # ),
         num_train_steps=40_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2000, peak_lr=3e-5, decay_steps=40_000, decay_lr=1e-6

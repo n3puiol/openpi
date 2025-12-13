@@ -10,7 +10,7 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-from openpi.models.dit import DiffusionTransformer, VideoTransformer
+from openpi.models.dit import DiffusionTransformer, MultiViewVideoTransformer
 from diffusers import FlaxAutoencoderKL
 
 
@@ -24,12 +24,15 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
     freq_dim: int = 256
     video_depth: int = 6
     eps: float = 1e-5
-    image_key: str = "base_0_rgb"
+    # image_key: str = "base_0_rgb"
     horizon: int = 5
     history_len: int = 5
     num_denoise_steps: int = 12
     pretrain: bool = True
-    
+    num_cross_view_layers: int = 2  # Number of cross-view attention layers
+    primary_image_key: str = "base_0_rgb"  # Primary view for loss computation
+    ignore_image_keys: list[str] = dataclasses.field(default_factory=list)
+
     action_dim: int = 32
     action_horizon: int = 10
     max_token_len: int = 48
@@ -42,10 +45,14 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
     #     "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
     # )
     alpha: float = 0.5  # blending factor for regularized reward
-    
+
     @override
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct(
+            [batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32
+        )
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -57,10 +64,16 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
                     "base_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                tokenized_prompt=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], jnp.int32
+                ),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], bool
+                ),
             )
-        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        action_spec = jax.ShapeDtypeStruct(
+            [batch_size, self.action_horizon, self.action_dim], jnp.float32
+        )
 
         return observation_spec, action_spec
 
@@ -98,7 +111,9 @@ class Pi0Predictor(_model.BaseModel):
     def __init__(self, config: Pi0PredictorConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self._eps = config.eps
-        self._image_key = config.image_key
+        self._primary_image_key = config.primary_image_key
+        self._ignore_image_keys = config.ignore_image_keys
+
         self._horizon = config.horizon
         self._history_len = config.history_len
         self._num_denoise_steps = config.num_denoise_steps
@@ -117,11 +132,19 @@ class Pi0Predictor(_model.BaseModel):
         self._vae_params = jax.tree_util.tree_map(lambda x: nnx.Param(x), vae_params)
         self._vae_scaling_factor = vae.config.scaling_factor
 
-        self._video_encoder = VideoTransformer(
+        # self._video_encoder = VideoTransformer(
+        #     in_channel=config.in_channel,
+        #     dim=config.hidden_size,
+        #     depth=config.video_depth,
+        #     num_heads=config.num_heads,
+        #     rngs=rngs,
+        # )
+        self._video_encoder = MultiViewVideoTransformer(
             in_channel=config.in_channel,
             dim=config.hidden_size,
             depth=config.video_depth,
             num_heads=config.num_heads,
+            num_cross_attn_layers=config.num_cross_view_layers,
             rngs=rngs,
         )
         self._action_embedder = nnx.Linear(32, config.hidden_size, rngs=rngs)
@@ -149,12 +172,52 @@ class Pi0Predictor(_model.BaseModel):
         latents = latents * self._vae_scaling_factor
         return latents
 
-    def embed_inputs(
+    def embed_inputs_multi_view(
         self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
-    ) -> at.Float[at.Array, "*b s emb"]:
-        """Encode images using SD VAE instead of PaliGemma."""
-        images = observation.images[self._image_key]
-        return self._encode_with_vae(images, rng)
+    ) -> tuple[list[jnp.ndarray], jnp.ndarray]:
+        """
+        Encode all available camera views and return embeddings.
+
+        Returns:
+            Tuple of:
+                - List of embeddings for all views, each [B, T, N, C]
+                - Primary view embedding for loss computation [B, T, N, C]
+        """
+        all_embeddings = []
+        primary_embedding = None
+
+        # Sort keys to ensure consistent ordering (primary key first)
+        image_keys = sorted(
+            observation.images.keys(), key=lambda k: (k != self._primary_image_key, k)
+        )
+
+        for key in image_keys:
+            if key in self._ignore_image_keys:
+                continue
+            images = observation.images[key]
+            rng, rng_vae = jax.random.split(rng)
+            embedding = self._encode_with_vae(images, rng_vae)
+
+            # Reshape:  [B, C, H', W'] -> [B, N, C] where N = H' * W'
+            b = embedding.shape[0]
+            embedding = embedding.reshape(b, -1, embedding.shape[-1])  # [B, N, C]
+
+            all_embeddings.append(embedding)
+
+            if key == self._primary_image_key:
+                primary_embedding = embedding
+
+        if primary_embedding is None:
+            primary_embedding = all_embeddings[0]
+
+        return all_embeddings, primary_embedding
+
+    # def embed_inputs(
+    #     self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
+    # ) -> at.Float[at.Array, "*b s emb"]:
+    #     """Encode images using SD VAE instead of PaliGemma."""
+    #     images = observation.images[self._image_key]
+    #     return self._encode_with_vae(images, rng)
 
     @override
     def compute_loss(
@@ -175,12 +238,36 @@ class Pi0Predictor(_model.BaseModel):
             train=train,
             image_keys=list(observation.images.keys()),
         )
-        embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
-        embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
+        # Multi-view path:  encode all views
+        all_view_embeddings, primary_embedding = self.embed_inputs_multi_view(
+            obs_p, train=train, rng=rng_embed
+        )
 
-        history = embeddings[:, : self._history_len]
-        future = embeddings[:, self._history_len :]
-        history_features = self._video_encoder(history)
+        # Reshape embeddings to [B, T, N, C] format
+        # Assuming temporal dimension is handled in observation structure
+        # Each embedding is [B*T, N, C], reshape to [B, T, N, C]
+        view_embeddings_reshaped = []
+        for emb in all_view_embeddings:
+            emb_reshaped = jnp.reshape(emb, (b, t, -1, 4))
+            view_embeddings_reshaped.append(emb_reshaped)
+
+        primary_embedding = jnp.reshape(primary_embedding, (b, t, -1, 4))
+
+        # Extract history portion for each view
+        history_views = [v[:, : self._history_len] for v in view_embeddings_reshaped]
+
+        # Get history features using multi-view encoder
+        history_features = self._video_encoder(history_views)
+
+        # Future is only from primary view (for loss computation)
+        future = primary_embedding[:, self._history_len :]
+
+        # embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
+        # embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
+
+        # history = embeddings[:, : self._history_len]
+        # future = embeddings[:, self._history_len :]
+        # history_features = self._video_encoder(history)
 
         if not self._pretrain:
             action_window = actions[:, self._history_len :]
@@ -215,91 +302,6 @@ class Pi0Predictor(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
         raise NotImplementedError("Action sampling not implemented for Pi0Predictor.")
-
-    # @override
-    # def compute_loss(
-    #     self,
-    #     rng: at.KeyArrayLike,
-    #     observation: _model.Observation,
-    #     actions: _model.Actions,
-    #     *,
-    #     train: bool = False,
-    # ) -> at.Float[at.Array, "*b ah"]:
-    #     b, t, _ = actions.shape
-    #     h_len, f_len = self._history_len, self._horizon
-
-    #     num_windows = (t - h_len) // f_len
-    #     if num_windows < 1:
-    #         raise ValueError(
-    #             f"Insufficient sequence length {t} for H={h_len}, F={f_len}"
-    #         )
-
-    #     # Preprocess and embed observations
-    #     rng, rng_preprocess, rng_embed = jax.random.split(rng, 3)
-    #     obs_p = _model.preprocess_observation(
-    #         rng_preprocess,
-    #         observation,
-    #         train=train,
-    #         image_keys=list(observation.images.keys()),
-    #     )
-    #     embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
-    #     embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
-
-    #     # Extract initial history
-    #     init_history = embeddings[:, :h_len]
-
-    #     # Prepare windows for scan:  (num_windows, B, f_len, ...)
-    #     valid_len = num_windows * f_len
-    #     targets = embeddings[:, h_len : h_len + valid_len]
-    #     targets = targets.reshape(b, num_windows, f_len, *targets.shape[2:])
-    #     targets = jnp.transpose(
-    #         targets, (1, 0, 2, 3, 4)
-    #     )  # (num_windows, B, f_len, N, C)
-
-    #     act_seq = actions[:, h_len : h_len + valid_len]
-    #     act_seq = act_seq.reshape(b, num_windows, f_len, -1)
-    #     act_seq = jnp.transpose(
-    #         act_seq, (1, 0, 2, 3)
-    #     )  # (num_windows, B, f_len, action_dim)
-
-    #     def scan_step(carry, inputs):
-    #         curr_history, step_rng = carry
-    #         target_window, action_window = inputs
-    #         batch_size = target_window.shape[0]
-
-    #         # Split RNG properly for noise and timestep
-    #         step_rng, rng_noise, rng_time = jax.random.split(step_rng, 3)
-
-    #         # Sample noise and timestep
-    #         noise = jax.random.normal(rng_noise, target_window.shape)
-    #         timestep = jax.random.uniform(
-    #             rng_time, (batch_size,), minval=0.02, maxval=0.98
-    #         )
-
-    #         # Flow matching interpolation:  x_t = (1-t)*x_0 + t*x_1
-    #         # where x_0 = noise, x_1 = target
-    #         t_broadcast = timestep[:, None, None, None]
-    #         x_t = (1.0 - t_broadcast) * noise + t_broadcast * target_window
-
-    #         # Target velocity: v = x_1 - x_0 = target - noise
-    #         target_velocity = target_window - noise
-
-    #         # Predict velocity
-    #         v_pred = self._diffusion_transformer(
-    #             x_t, curr_history, action_window, timestep
-    #         )
-
-    #         # MSE loss
-    #         loss = jnp.mean(jnp.square(v_pred - target_velocity))
-
-    #         # Note: History stays fixed (parallel window training, not autoregressive)
-    #         # For autoregressive:  next_history = concat(curr_history[:, f_len:], target_window)
-    #         return (curr_history, step_rng), loss
-
-    #     init_carry = (init_history, rng)
-    #     _, losses = jax.lax.scan(scan_step, init_carry, (targets, act_seq))
-
-    #     return jnp.mean(losses)
 
     def _decode_with_vae(self, latents: jnp.ndarray) -> jnp.ndarray:
         """Decode latents back to images using the VAE decoder.
@@ -375,15 +377,33 @@ class Pi0Predictor(_model.BaseModel):
             rng, observation, train=False, image_keys=list(observation.images.keys())
         )
         rng, rng_embed = jax.random.split(rng)
-        embeddings = self.embed_inputs(obs_p, train=False, rng=rng_embed)
-        embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
 
-        _, _, N, C = embeddings.shape
-        history = embeddings[:, : self._history_len]
-        history_features = self._video_encoder(history)
+        all_view_embeddings, primary_embedding = self.embed_inputs_multi_view(
+            obs_p, train=False, rng=rng_embed
+        )
+
+        view_embeddings_reshaped = []
+        for emb in all_view_embeddings:
+            emb_reshaped = jnp.reshape(emb, (b, t, -1, 4))
+            view_embeddings_reshaped.append(emb_reshaped)
+
+        primary_embedding = jnp.reshape(primary_embedding, (b, t, -1, 4))
+        _, _, N, C = primary_embedding.shape
+
+        history_views = [v[:, : self._history_len] for v in view_embeddings_reshaped]
+        history_features = self._video_encoder(history_views)
+
+        # embeddings = self.embed_inputs(obs_p, train=False, rng=rng_embed)
+        # embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
+
+        # _, _, N, C = embeddings.shape
+        # history = embeddings[:, : self._history_len]
+        # history_features = self._video_encoder(history)
 
         if not self._pretrain:
-            action_window = actions[:, self._history_len : self._history_len + self._horizon]
+            action_window = actions[
+                :, self._history_len : self._history_len + self._horizon
+            ]
             action_features = self._action_embedder(action_window)
         else:
             action_features = None
