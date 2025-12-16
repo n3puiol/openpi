@@ -2,15 +2,18 @@ from collections.abc import Iterator, Sequence
 from functools import partial
 import multiprocessing
 import os
+from pathlib import Path
 import typing
 from typing import Protocol, SupportsIndex, TypeVar
+from datasets import Dataset as ds, DatasetDict
 
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
-from datasets import load_dataset
+import io
+import av
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -154,11 +157,6 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    # horizon = (
-    #     range(-action_horizon // 2, action_horizon // 2)
-    #     if data_config.predictor
-    #     else range(action_horizon)
-    # )
     horizon = range(action_horizon)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -176,58 +174,22 @@ def create_torch_dataset(
     return dataset
 
 
-@partial(jax.jit, static_argnums=(1, 2))
-def _process_and_resize_video_jax(
-    stacked_frames: jnp.ndarray, num_frames: int, resolution: int = 224
-) -> jnp.ndarray:
-    """
-    JIT-compiled video processing pipeline:
-    1. Uniformly sample frames
-    2. Center crop to square
-    3. Resize to target resolution
+def load_something_something_parquet(data_dir):
+    data_dir = Path(data_dir)
 
-    Args:
-        stacked_frames:  Input video array of shape (T, C, H, W) or (T, H, W, C)
-        num_frames: Number of frames to sample
-        resolution: Target resolution for output frames
+    splits = {}
+    for split in ["train", "validation", "test"]:
+        split_dir = data_dir / split
+        if split_dir.exists():
+            parquet_files = sorted(split_dir.glob("*.parquet"))
+            if parquet_files:
+                splits[split] = ds.from_parquet([str(f) for f in parquet_files])
 
-    Returns:
-        Processed video array of shape (num_frames, resolution, resolution, C)
-    """
-    # Ensure (T, H, W, C) format for consistent processing
-    if stacked_frames.shape[1] == 3 and stacked_frames.ndim == 4:  # (T, C, H, W)
-        stacked_frames = jnp.transpose(stacked_frames, (0, 2, 3, 1))
-
-    total_frames, H, W, C = stacked_frames.shape
-
-    # Uniform frame sampling
-    indices = jnp.linspace(0, total_frames - 1, num_frames).astype(jnp.int32)
-    sampled = stacked_frames[indices]
-
-    # Center crop to square
-    size = min(H, W)
-    top = (H - size) // 2
-    left = (W - size) // 2
-    cropped = jax.lax.dynamic_slice(
-        sampled,
-        start_indices=(0, top, left, 0),
-        slice_sizes=(num_frames, size, size, C),
-    )
-
-    # Resize to target resolution
-    resized = jax.image.resize(
-        cropped.astype(jnp.float32),
-        shape=(num_frames, resolution, resolution, C),
-        method="bilinear",
-    )
-    
-    resized = jnp.clip(resized / 127.5 - 1.0, -1.0, 1.0)
-
-    return resized
+    return DatasetDict(splits)
 
 
 class SomethingSomethingV2Dataset(Dataset):
-    """Something-Something V2 dataset using HuggingFace datasets."""
+    """Something-Something V2 dataset using HuggingFace datasets with tar archive."""
 
     def __init__(
         self,
@@ -236,14 +198,48 @@ class SomethingSomethingV2Dataset(Dataset):
         model_config: _model.BaseModelConfig,
     ):
         self.num_frames = action_horizon
-        self.resolution = 224
+
         repo_id = data_config.repo_id
-
         if repo_id is None:
-            raise ValueError("Repo ID is not set. Cannot create dataset.")
+            raise ValueError("Repo ID is not set. Cannot create SSV2 dataset.")
 
-        self.dataset = load_dataset(repo_id)
+        # Load the parquet dataset
+        self.dataset = load_something_something_parquet(data_config.repo_id)
+
+        # Get the shapes required by the model
         self._observation_spec, self._action_spec = model_config.inputs_spec()
+
+    def _process_video(self, item):
+        """
+        Decodes video bytes, resizes, and temporally samples frames to match configuration.
+        """
+        video_bytes = item.get("video")
+        if not video_bytes:
+            return None
+
+        try:
+            container = av.open(io.BytesIO(video_bytes))
+
+            frames = []
+            for frame in container.decode(video=0):
+                frames.append(frame.to_rgb().to_ndarray())
+
+            container.close()
+
+            if not frames:
+                return None
+
+            total_frames = len(frames)
+            indices = np.linspace(0, total_frames - 1, self.num_frames).astype(int)
+            video_np = np.stack([frames[i] for i in indices])
+
+            video_np = video_np.astype(np.float32) / 255.0
+
+            return jnp.array(video_np)
+
+        except Exception as e:
+            print(f"Error decoding video: {e}")  # Debugging
+            return None
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         def make_from_spec(spec: jax.ShapeDtypeStruct):
@@ -251,36 +247,28 @@ class SomethingSomethingV2Dataset(Dataset):
             return jnp.zeros(shape=shape, dtype=spec.dtype)
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
-        action = jax.tree.map(make_from_spec, self._action_spec)
 
         observation_dict = observation.to_dict()
         item = self.dataset["train"][index]
-        video_data = self._process_video(item["video"])
+
+        label = item["label"]
+
+        video_data = self._process_video(item)
+
         if video_data is None:
+            # Skip to next video if processing fails (wrapping around dataset)
             return self.__getitem__((index.__index__() + 1) % len(self))
-        
 
         observation_dict["image"]["base_0_rgb"] = video_data
+
         return {
             **observation_dict,
-            "actions": action,
+            "prompt": label,
+            "actions": None,
         }
 
     def __len__(self) -> int:
         return len(self.dataset["train"])
-
-    def _process_video(self, video_reader) -> jnp.ndarray | None:
-        """Process video from HuggingFace format, optimized for JAX."""
-        frames = [frame["data"].numpy() for frame in video_reader]
-
-        if len(frames) < self.num_frames:
-            return None
-
-        video_array = jnp.stack(frames, axis=0)
-
-        return _process_and_resize_video_jax(
-            video_array, self.num_frames, self.resolution
-        )
 
 
 def create_rlds_dataset(
@@ -375,7 +363,7 @@ def create_ssv2_dataloader(
         action_horizon=config.model.action_horizon,
         model_config=config.model,
     )
-    # dataset = transform_dataset(dataset, data_config, skip_norm_stats=True)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=True)
 
     data_loader = TorchDataLoader(
         dataset,

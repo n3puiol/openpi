@@ -121,13 +121,23 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI0_PREDICTOR:
+            case _model.ModelType.PI0:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        ),
+                    ],
+                )
+            case _model.ModelType.PI0_PREDICTOR:
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.ClipTokenizer(model_config.max_token_len),
                         ),
                     ],
                 )
@@ -219,13 +229,15 @@ class FakeDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class SSV2DataConfig(DataConfigFactory):
-    repo_id: str = "jxie/something_something_v2"
-
     @override
     def create(
         self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
     ) -> DataConfig:
-        return DataConfig(repo_id=self.repo_id)
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            model_transforms=model_transforms,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -671,9 +683,10 @@ _CONFIGS = [
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
             action_horizon=10,
-            pretrain=True,
         ),
-        data=SSV2DataConfig(),
+        data=SSV2DataConfig(
+            repo_id="/scratch/s5649552/.cache/data/ssv2_parquet",
+        ),
         # weight_loader=weight_loaders.CheckpointWeightLoader(
         #     "gs://openpi-assets/checkpoints/pi0_libero/params"
         # ),
@@ -685,7 +698,7 @@ _CONFIGS = [
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
         ),
         freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
-        batch_size=2,
+        batch_size=1,
         ema_decay=None,
     ),
     TrainConfig(
@@ -693,7 +706,6 @@ _CONFIGS = [
         project_name="openpi_predictor",
         model=pi0_predictor.Pi0PredictorConfig(
             action_horizon=10,
-            pretrain=False,
             ignore_image_keys=["right_wrist_0_rgb"],
         ),
         data=LeRobotLiberoDataConfig(
@@ -713,7 +725,7 @@ _CONFIGS = [
         # ),
         num_train_steps=40_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000, peak_lr=3e-5, decay_steps=40_000, decay_lr=1e-6
+            warmup_steps=2000, peak_lr=1e-5, decay_steps=40_000, decay_lr=1e-7
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0

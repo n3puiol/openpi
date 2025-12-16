@@ -135,7 +135,7 @@ class Observation(Generic[ArrayT]):
 
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
-Actions = at.Float[ArrayT, "*b ah ad"]
+Actions = at.Float[ArrayT, "*b ah ad"] | None
 HorizonImages = at.Float[ArrayT, "*b t h w c"]
 
 

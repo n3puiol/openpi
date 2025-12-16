@@ -43,42 +43,127 @@ def get_2d_sincos_pos_embed(embed_dim: int, grid: Tuple[int, int]) -> jnp.ndarra
     return emb.reshape(1, t * n, embed_dim)
 
 
-def make_block_causal_mask(T: int, N: int) -> jnp.ndarray:
+# def make_block_causal_mask(T: int, N: int) -> jnp.ndarray:
+#     """
+#     Creates a mask for Cross-Attention where queries are (T*N) flattened video tokens
+#     and keys are (N + T) context tokens (N history + T actions).
+
+#     History tokens (first N columns) are always visible.
+#     Action tokens (last T columns) are causally masked based on time block.
+
+#     Returns:
+#         mask: Boolean tensor shape (1, 1, T*N, N+T) ready for broadcasting over Batch and Heads.
+#               True means allowed, False means masked.
+#     """
+#     # 1. Create time indices for the query rows (T*N rows)
+#     # Each block of N rows corresponds to one time step.
+#     # e.g., T=2, N=3 -> [0, 0, 0, 1, 1, 1]
+#     query_time_idx = jnp.repeat(jnp.arange(T), N)
+
+#     # 2. Create time indices for the action key columns (last T columns)
+#     # e.g., T=2 -> [0, 1]
+#     key_action_time_idx = jnp.arange(T)
+
+#     # 3. Create the causal mask for the action section.
+#     # A query at time t_q can see an action at time t_k if t_q >= t_k.
+#     # Shape: (T*N, T)
+#     action_mask = query_time_idx[:, None] >= key_action_time_idx[None, :]
+
+#     # 4. Create the history mask (always True).
+#     # Shape: (T*N, N)
+#     history_mask = jnp.ones((T * N, N), dtype=jnp.bool_)
+
+#     # 5. Concatenate to form the full mask.
+#     # Shape: (T*N, N + T)
+#     full_mask = jnp.concatenate([history_mask, action_mask], axis=1)
+
+#     # 6. Reshape for broadcasting over Batch and Heads dimensions in attention.
+#     # Final shape: (1, 1, T*N, N+T)
+#     return full_mask[None, None, :, :]
+
+
+def make_block_causal_mask(T: int, num_history: int, num_task: int = 1) -> jnp.ndarray:
     """
     Creates a mask for Cross-Attention where queries are (T*N) flattened video tokens
-    and keys are (N + T) context tokens (N history + T actions).
+    and keys are (num_history + num_task + T) context tokens.
 
-    History tokens (first N columns) are always visible.
-    Action tokens (last T columns) are causally masked based on time block.
+    - History tokens (first num_history columns) are always visible.
+    - Task tokens (next num_task columns) are always visible.
+    - Action tokens (last T columns) are causally masked based on time block.
+
+    Args:
+        T: Number of future timesteps (also number of action tokens)
+        num_history: Number of history tokens (N spatial tokens from video encoder)
+        num_task: Number of task tokens (default 1 for pooled CLIP embedding)
 
     Returns:
-        mask: Boolean tensor shape (1, 1, T*N, N+T) ready for broadcasting over Batch and Heads.
+        mask: Boolean tensor shape (1, 1, T*N, num_history + num_task + T)
+              ready for broadcasting over Batch and Heads.
               True means allowed, False means masked.
     """
-    # 1. Create time indices for the query rows (T*N rows)
-    # Each block of N rows corresponds to one time step.
+    # For simplicity, we use T as the number of query time blocks
+    # Each block has N spatial tokens, but mask broadcasts over N
+
+    # 1. Create time indices for the query rows (T rows, will broadcast over N)
+    query_time_idx = jnp.arange(T)
+
+    # 2. History tokens are always visible
+    # Shape: (T, num_history)
+    history_mask = jnp.ones((T, num_history), dtype=jnp.bool_)
+
+    # 3. Task tokens are always visible
+    # Shape: (T, num_task)
+    task_mask = jnp.ones((T, num_task), dtype=jnp.bool_)
+
+    # 4. Action tokens are causally masked
+    # A query at time t_q can see an action at time t_k if t_q >= t_k
+    # Shape: (T, T)
+    key_action_time_idx = jnp.arange(T)
+    action_mask = query_time_idx[:, None] >= key_action_time_idx[None, :]
+
+    # 5. Concatenate: [history | task | actions]
+    # Shape: (T, num_history + num_task + T)
+    full_mask = jnp.concatenate([history_mask, task_mask, action_mask], axis=1)
+
+    # 6. Expand for spatial dimension and batch/head broadcasting
+    # We need (1, 1, T, num_history + num_task + T) which will broadcast to (B, H, T*N, K)
+    # when queries are reshaped. For proper broadcasting over N spatial tokens per time step,
+    # we repeat the mask N times (handled implicitly by attention mechanism)
+    return full_mask[None, None, :, :]
+
+
+def make_block_causal_mask_with_spatial(
+    T: int, N: int, num_history: int, num_task: int = 1
+) -> jnp.ndarray:
+    """
+    Creates a mask for Cross-Attention with explicit spatial dimension handling.
+
+    Args:
+        T: Number of future timesteps
+        N: Number of spatial tokens per timestep
+        num_history: Number of history tokens
+        num_task: Number of task tokens
+
+    Returns:
+        mask: Boolean tensor shape (1, 1, T*N, num_history + num_task + T)
+    """
+    # Query time indices: each spatial token in a time block gets the same time index
     # e.g., T=2, N=3 -> [0, 0, 0, 1, 1, 1]
     query_time_idx = jnp.repeat(jnp.arange(T), N)
 
-    # 2. Create time indices for the action key columns (last T columns)
-    # e.g., T=2 -> [0, 1]
-    key_action_time_idx = jnp.arange(T)
+    # History tokens are always visible: (T*N, num_history)
+    history_mask = jnp.ones((T * N, num_history), dtype=jnp.bool_)
 
-    # 3. Create the causal mask for the action section.
-    # A query at time t_q can see an action at time t_k if t_q >= t_k.
-    # Shape: (T*N, T)
+    # Task tokens are always visible: (T*N, num_task)
+    task_mask = jnp.ones((T * N, num_task), dtype=jnp.bool_)
+
+    # Action tokens are causally masked: (T*N, T)
+    key_action_time_idx = jnp.arange(T)
     action_mask = query_time_idx[:, None] >= key_action_time_idx[None, :]
 
-    # 4. Create the history mask (always True).
-    # Shape: (T*N, N)
-    history_mask = jnp.ones((T * N, N), dtype=jnp.bool_)
+    # Concatenate: [history | task | actions]
+    full_mask = jnp.concatenate([history_mask, task_mask, action_mask], axis=1)
 
-    # 5. Concatenate to form the full mask.
-    # Shape: (T*N, N + T)
-    full_mask = jnp.concatenate([history_mask, action_mask], axis=1)
-
-    # 6. Reshape for broadcasting over Batch and Heads dimensions in attention.
-    # Final shape: (1, 1, T*N, N+T)
     return full_mask[None, None, :, :]
 
 
@@ -224,7 +309,7 @@ class MultiViewVideoTransformer(nnx.Module):
         self.inp = nnx.Linear(in_channel, dim, rngs=rngs)
 
         # Learnable view embeddings (will be expanded dynamically)
-        self.max_views = 8  # Maximum number of views supported
+        self.max_views = 4  # Maximum number of views supported
         self.view_embeddings = nnx.Param(
             jnp.zeros((self.max_views, 1, dim), dtype=jnp.float32)
         )
@@ -515,8 +600,9 @@ class DiffusionTransformer(nnx.Module):
         self,
         x_noisy,
         history_features,
+        task_features,  # [B, hidden_size]
         timestep,
-        action_tokens=None,  # Optional!
+        action_tokens=None,  # Optional [B, T, hidden_size]
     ):
         B, T, N, C = x_noisy.shape
 
@@ -530,14 +616,23 @@ class DiffusionTransformer(nnx.Module):
         # Time embedding
         t_fea = self.time_encoder(jnp.log(timestep + 1e-8))
 
-        # Context:  history only, or history + actions
+        # Expand task_features to have sequence dimension: [B, hidden_size] -> [B, 1, hidden_size]
+        task_tokens = task_features[:, None, :]  # [B, 1, hidden_size]
+
+        # Build context: [history | task | actions (optional)]
+        context_parts = [history_features, task_tokens]
+
+        num_history = history_features.shape[1]
+        num_task = 1  # Single task token
+
         if action_tokens is not None:
-            context_fea = jnp.concatenate([history_features, action_tokens], axis=1)
-            ctx_mask = make_block_causal_mask(T, history_features.shape[1])
+            context_parts.append(action_tokens)
+            # Use mask with spatial dimension handling
+            ctx_mask = make_block_causal_mask_with_spatial(T, N, num_history, num_task)
         else:
-            # No actions - just use history
-            context_fea = history_features
-            ctx_mask = None  # Full attention to all history tokens
+            ctx_mask = None  # Full attention to all context tokens
+
+        context_fea = jnp.concatenate(context_parts, axis=1)
 
         # Transformer blocks
         for i, (_, block) in enumerate(self.blocks.items()):

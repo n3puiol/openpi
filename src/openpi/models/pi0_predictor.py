@@ -11,10 +11,11 @@ import jax
 import jax.numpy as jnp
 
 from openpi.models.dit import DiffusionTransformer, MultiViewVideoTransformer
+
 from diffusers import FlaxAutoencoderKL
+from transformers import FlaxCLIPTextModel
 
 
-# class Pi0PredictorConfig(Pi0Config):
 @dataclasses.dataclass(frozen=True)
 class Pi0PredictorConfig(_model.BaseModelConfig):
     in_channel: int = 4
@@ -28,7 +29,6 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
     horizon: int = 5
     history_len: int = 5
     num_denoise_steps: int = 12
-    pretrain: bool = True
     num_cross_view_layers: int = 2  # Number of cross-view attention layers
     primary_image_key: str = "base_0_rgb"  # Primary view for loss computation
     ignore_image_keys: list[str] = dataclasses.field(default_factory=list)
@@ -36,15 +36,6 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
     action_dim: int = 32
     action_horizon: int = 10
     max_token_len: int = 48
-
-    # Reward estimation embeddings
-    # baseline_embedding_path: str = (
-    #     "/scratch/s5649552/openpi/reward_estimation_embeddings/baseline_embedding_pi0_libero_predictor.npy"
-    # )
-    # goal_embedding_path: str = (
-    #     "/scratch/s5649552/openpi/reward_estimation_embeddings/goal_embedding_pi0_libero_predictor.npy"
-    # )
-    alpha: float = 0.5  # blending factor for regularized reward
 
     @override
     def inputs_spec(
@@ -64,12 +55,6 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
                     "base_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct(
-                    [batch_size, self.max_token_len], jnp.int32
-                ),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct(
-                    [batch_size, self.max_token_len], bool
-                ),
             )
         action_spec = jax.ShapeDtypeStruct(
             [batch_size, self.action_horizon, self.action_dim], jnp.float32
@@ -102,7 +87,8 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
         dit_filter = nnx_utils.PathRegex("_diffusion_transformer.*")
         ae_filter = nnx_utils.PathRegex("_action_embedder.*")
         ve_filter = nnx_utils.PathRegex("_video_encoder.*")
-        trainable = nnx.Any(dit_filter, ae_filter, ve_filter)
+        tp_filter = nnx_utils.PathRegex("_task_proj.*")
+        trainable = nnx.Any(dit_filter, ae_filter, ve_filter, tp_filter)
         return nnx.Not(trainable)
 
 
@@ -114,16 +100,10 @@ class Pi0Predictor(_model.BaseModel):
         self._primary_image_key = config.primary_image_key
         self._ignore_image_keys = config.ignore_image_keys
 
+        self._action_horizon = config.action_horizon
         self._horizon = config.horizon
         self._history_len = config.history_len
         self._num_denoise_steps = config.num_denoise_steps
-        # self._baseline_embedding = nnx.Variable(
-        #     jnp.load(config.baseline_embedding_path)
-        # )
-        # self._goal_embedding = nnx.Variable(jnp.load(config.goal_embedding_path))
-        self._alpha = config.alpha
-
-        self._pretrain = config.pretrain
 
         vae, vae_params = FlaxAutoencoderKL.from_pretrained(
             "stabilityai/sd-vae-ft-mse", from_pt=True, dtype=jnp.float32
@@ -132,13 +112,17 @@ class Pi0Predictor(_model.BaseModel):
         self._vae_params = jax.tree_util.tree_map(lambda x: nnx.Param(x), vae_params)
         self._vae_scaling_factor = vae.config.scaling_factor
 
-        # self._video_encoder = VideoTransformer(
-        #     in_channel=config.in_channel,
-        #     dim=config.hidden_size,
-        #     depth=config.video_depth,
-        #     num_heads=config.num_heads,
-        #     rngs=rngs,
-        # )
+        clip_model = FlaxCLIPTextModel.from_pretrained(
+            "openai/clip-vit-base-patch32", dtype=jnp.float32
+        )
+
+        self._clip_module = clip_model.module
+        self._clip_params = jax.tree_util.tree_map(
+            lambda x: nnx.Param(x), clip_model.params
+        )
+
+        self._task_proj = nnx.Linear(512, config.hidden_size, rngs=rngs)
+
         self._video_encoder = MultiViewVideoTransformer(
             in_channel=config.in_channel,
             dim=config.hidden_size,
@@ -171,6 +155,36 @@ class Pi0Predictor(_model.BaseModel):
         latents = posterior.latent_dist.sample(rng)
         latents = latents * self._vae_scaling_factor
         return latents
+
+    def encode_text(self, observation: _model.Observation) -> jnp.ndarray:
+        """Encode task descriptions using CLIP."""
+        input_ids = observation.tokenized_prompt
+        attention_mask = observation.tokenized_prompt_mask
+
+        # Generate position_ids based on input shape
+        batch_size, seq_len = input_ids.shape
+        position_ids = jnp.broadcast_to(
+            jnp.arange(seq_len)[None, :], (batch_size, seq_len)
+        )
+
+        text_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+
+        clip_params_raw = jax.tree_util.tree_map(lambda x: x.value, self._clip_params)
+
+        outputs = self._clip_module.apply(
+            {"params": clip_params_raw},
+            **text_inputs,
+            deterministic=True,
+        )
+
+        # Return pooled output (CLS token) for task conditioning
+        # Stop gradient to keep CLIP frozen
+        pooled = jax.lax.stop_gradient(outputs.pooler_output)  # [B, 512]
+        return pooled
 
     def embed_inputs_multi_view(
         self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
@@ -212,13 +226,6 @@ class Pi0Predictor(_model.BaseModel):
 
         return all_embeddings, primary_embedding
 
-    # def embed_inputs(
-    #     self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
-    # ) -> at.Float[at.Array, "*b s emb"]:
-    #     """Encode images using SD VAE instead of PaliGemma."""
-    #     images = observation.images[self._image_key]
-    #     return self._encode_with_vae(images, rng)
-
     @override
     def compute_loss(
         self,
@@ -228,8 +235,9 @@ class Pi0Predictor(_model.BaseModel):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b"]:
-        b, t, _ = actions.shape
-
+        b = observation.state.shape[0]
+        t = self._action_horizon
+        
         # Preprocess and embed observations
         rng, rng_preprocess, rng_embed = jax.random.split(rng, 3)
         obs_p = _model.preprocess_observation(
@@ -242,6 +250,9 @@ class Pi0Predictor(_model.BaseModel):
         all_view_embeddings, primary_embedding = self.embed_inputs_multi_view(
             obs_p, train=train, rng=rng_embed
         )
+
+        task_embedding = self.encode_text(obs_p)  # [B, 512]
+        task_features = self._task_proj(task_embedding)  # [B, hidden_size]
 
         # Reshape embeddings to [B, T, N, C] format
         # Assuming temporal dimension is handled in observation structure
@@ -262,14 +273,7 @@ class Pi0Predictor(_model.BaseModel):
         # Future is only from primary view (for loss computation)
         future = primary_embedding[:, self._history_len :]
 
-        # embeddings = self.embed_inputs(obs_p, train=train, rng=rng_embed)
-        # embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
-
-        # history = embeddings[:, : self._history_len]
-        # future = embeddings[:, self._history_len :]
-        # history_features = self._video_encoder(history)
-
-        if not self._pretrain:
+        if actions is not None:
             action_window = actions[:, self._history_len :]
             action_features = self._action_embedder(action_window)
         else:
@@ -284,8 +288,9 @@ class Pi0Predictor(_model.BaseModel):
         target_velocity = future - noise
 
         v_pred = self._diffusion_transformer(
-            x_t,
-            history_features,
+            x_noisy=x_t,
+            history_features=history_features,
+            task_features=task_features,
             action_tokens=action_features,
             timestep=timestep,
         )
@@ -371,7 +376,9 @@ class Pi0Predictor(_model.BaseModel):
 
         Uses Heun's method when num_denoise_steps >= 10, otherwise Euler.
         """
-        b, t, _ = actions.shape
+        # b, t, _ = actions.shape
+        b = observation.state.shape[0]
+        t = self._action_horizon
 
         obs_p = _model.preprocess_observation(
             rng, observation, train=False, image_keys=list(observation.images.keys())
@@ -381,6 +388,10 @@ class Pi0Predictor(_model.BaseModel):
         all_view_embeddings, primary_embedding = self.embed_inputs_multi_view(
             obs_p, train=False, rng=rng_embed
         )
+
+        # Encode task text
+        task_embedding = self.encode_text(obs_p)  # [B, 512]
+        task_features = self._task_proj(task_embedding)  # [B, hidden_size]
 
         view_embeddings_reshaped = []
         for emb in all_view_embeddings:
@@ -393,14 +404,7 @@ class Pi0Predictor(_model.BaseModel):
         history_views = [v[:, : self._history_len] for v in view_embeddings_reshaped]
         history_features = self._video_encoder(history_views)
 
-        # embeddings = self.embed_inputs(obs_p, train=False, rng=rng_embed)
-        # embeddings = jnp.reshape(embeddings, (b, t, -1, 4))
-
-        # _, _, N, C = embeddings.shape
-        # history = embeddings[:, : self._history_len]
-        # history_features = self._video_encoder(history)
-
-        if not self._pretrain:
+        if actions is not None:
             action_window = actions[
                 :, self._history_len : self._history_len + self._horizon
             ]
@@ -422,8 +426,9 @@ class Pi0Predictor(_model.BaseModel):
             """First-order Euler integration."""
             t_batch = jnp.full((b,), timestep)
             v_pred = self._diffusion_transformer(
-                x_curr,
-                history_features,
+                x_noisy=x_curr,
+                history_features=history_features,
+                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_batch,
             )
@@ -437,8 +442,9 @@ class Pi0Predictor(_model.BaseModel):
 
             # Predictor:  Euler step
             k1 = self._diffusion_transformer(
-                x_curr,
-                history_features,
+                x_noisy=x_curr,
+                history_features=history_features,
+                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_batch,
             )
@@ -446,8 +452,9 @@ class Pi0Predictor(_model.BaseModel):
 
             # Corrector: average slopes
             k2 = self._diffusion_transformer(
-                x_pred,
-                history_features,
+                x_noisy=x_pred,
+                history_features=history_features,
+                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_next_batch,
             )
@@ -463,22 +470,3 @@ class Pi0Predictor(_model.BaseModel):
         if decode_to_images:
             return self._decode_with_vae(predicted_latents)
         return predicted_latents
-
-    # def compute_regularized_reward(self, state_embedding: jnp.ndarray) -> jnp.ndarray:
-    #     s = state_embedding
-    #     g = self._goal_embedding.value
-    #     b = self._baseline_embedding.value
-
-    #     direction_vector = g - b
-    #     direction_vector_norm_sq = jnp.sum(direction_vector**2)
-
-    #     s_minus_b = s - b
-    #     projection_scalar = jnp.dot(s_minus_b, direction_vector) / jnp.maximum(
-    #         direction_vector_norm_sq, 1e-6
-    #     )
-    #     projected_s = b + projection_scalar * direction_vector
-
-    #     blended_embedding = (1 - self._alpha) * s + self._alpha * projected_s
-
-    #     reward = 1.0 - 0.5 * jnp.sum((blended_embedding - g) ** 2)
-    #     return reward
