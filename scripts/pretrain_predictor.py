@@ -270,6 +270,18 @@ def log_predicted_images(
     images_to_log.append(
         wandb.Image(concat_frames, caption=f"Step {step}: Predicted future frames")
     )
+    # log the images from the first example in the batch based on images.values()
+    images_to_log.extend(
+        [
+            wandb.Image(
+                np.concatenate(
+                    [np.array(observation.images[view][0]) for view in observation.images],
+                    axis=1,
+                ),
+                caption=f"Step {step}: Camera views",
+            )
+        ]
+    )
 
     wandb.log({"predicted_future_images": images_to_log}, step=step)
 
@@ -326,10 +338,6 @@ def main(config: _config.TrainConfig):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
-
-    # check min and max pixel values
-    sample_image = jax.device_get(batch[0].images["base_0_rgb"][0])
-    logging.info(f"Sample image pixel range: min={sample_image.min()}, max={sample_image.max()}")
 
     train_state, train_state_sharding = init_train_state(
         config, init_rng, mesh, resume=resuming
