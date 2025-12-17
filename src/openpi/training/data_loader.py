@@ -1,5 +1,4 @@
 from collections.abc import Iterator, Sequence
-from functools import partial
 import multiprocessing
 import os
 from pathlib import Path

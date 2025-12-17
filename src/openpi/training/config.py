@@ -692,7 +692,7 @@ _CONFIGS = [
         # ),
         num_train_steps=80_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
+            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
@@ -719,13 +719,13 @@ _CONFIGS = [
                 action_sequence_keys=("actions", "image", "wrist_image"),
             ),
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader(
-        #     # "gs://openpi-assets/checkpoints/pi0_libero/params"
-        #     "/scratch/s5649552/openpi/checkpoints/pi0_ssv2_predictor/predictor_pretrain/39999/params"
-        # ),
-        num_train_steps=40_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            # "gs://openpi-assets/checkpoints/pi0_libero/params"
+            "/scratch/s5649552/openpi/checkpoints/pi0_ssv2_predictor/predictor_pretrain/79999/params"
+        ),
+        num_train_steps=80_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000, peak_lr=1e-5, decay_steps=40_000, decay_lr=1e-7
+            warmup_steps=20_000, peak_lr=1e-5, decay_steps=80_000, decay_lr=1e-7
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
