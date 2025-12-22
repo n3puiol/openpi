@@ -164,47 +164,6 @@ class FASTTokenizer:
         )
 
 
-class ClipTokenizer:
-    """CLIP-based text tokenizer."""
-
-    def __init__(self, max_len: int = 77):
-        self._max_len = max_len
-        self._clip_tokenizer = CLIPTokenizer.from_pretrained(
-            "openai/clip-vit-base-patch32"
-        )
-
-    def tokenize(self, prompt: str) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize a text prompt using CLIP tokenizer.
-
-        Args:
-            prompt: The text prompt to tokenize.
-
-        Returns:
-            A tuple of (tokens, attention_mask) as numpy arrays.
-        """
-        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
-
-        # Tokenize with CLIP tokenizer
-        encoded = self._clip_tokenizer(
-            cleaned_text,
-            max_length=self._max_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="np",
-        )
-
-        tokens = encoded["input_ids"][0]
-        mask = encoded["attention_mask"][0].astype(bool)
-
-        if len(self._clip_tokenizer.encode(cleaned_text)) > self._max_len:
-            logging.warning(
-                f"Token length exceeds max length ({self._max_len}), truncating. "
-                "Consider increasing the `max_token_len` in your model config if this happens frequently."
-            )
-
-        return tokens, mask
-
-
 ###########################################################################
 ## The tokenizers below are used for RoboArena baseline implementations. ##
 ## They are *not* used for pi0-style models.                             ##
