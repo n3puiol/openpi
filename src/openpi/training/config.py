@@ -121,23 +121,13 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI0_PREDICTOR:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                    ],
-                )
-            case _model.ModelType.PI0_PREDICTOR:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.ClipTokenizer(model_config.max_token_len),
                         ),
                     ],
                 )
@@ -407,6 +397,86 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotHydraDataConfig(DataConfigFactory):
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.image",
+                        "observation/wrist_image": "observation.images.wrist_image",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                libero_policy.LiberoInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotViolaDataConfig(DataConfigFactory):
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.agentview_rgb",
+                        "observation/wrist_image": "observation.images.eye_in_hand_rgb",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                libero_policy.LiberoInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -545,10 +615,6 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
-    val_split: float = 0  # Fraction of data to use for validation
-    val_interval: int = 1000  # Run validation every N steps
-    max_val_batches: int | None = 100  # Limit validation batches
-
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -681,15 +747,19 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_ssv2_predictor",
         project_name="openpi_predictor",
+        exp_name="predictor_pretrain",
+        overwrite=True,
         model=pi0_predictor.Pi0PredictorConfig(
             action_horizon=10,
+            ignore_image_keys=["right_wrist_0_rgb"],
         ),
         data=SSV2DataConfig(
             repo_id="/scratch/s5649552/.cache/data/ssv2_parquet",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="franka",
+            ),
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader(
-        #     "gs://openpi-assets/checkpoints/pi0_libero/params"
-        # ),
         num_train_steps=80_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
@@ -711,12 +781,17 @@ _CONFIGS = [
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             assets=AssetsConfig(
-                assets_dir="/scratch/s5649552/.cache/openpi/openpi-assets/checkpoints/pi0_libero/assets",
+                assets_dir="gs://openpi-assets/checkpoints/pi0_libero/assets",
+                asset_id="physical-intelligence/libero",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
-                action_sequence_keys=("actions", "image", "wrist_image"),
+                action_sequence_keys=(
+                    "actions",
+                    "observation.images.image",
+                    "observation.images.wrist_image",
+                ),
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -726,6 +801,102 @@ _CONFIGS = [
         num_train_steps=80_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=20_000, peak_lr=1e-5, decay_steps=80_000, decay_lr=1e-7
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+        ),
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=1,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_hydra_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_horizon=10,
+            ignore_image_keys=["right_wrist_0_rgb"],
+        ),
+        data=LeRobotHydraDataConfig(
+            repo_id="IPEC-COMMUNITY/stanford_hydra_dataset_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/openpi/assets/pi0_hydra_predictor",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                predictor=True,
+                action_sequence_keys=(
+                    "action",
+                    "observation.images.image",
+                    "observation.images.wrist_image",
+                ),
+            ),
+        ),
+        num_train_steps=80_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+        ),
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=1,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_viola_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_horizon=10,
+            ignore_image_keys=["right_wrist_0_rgb"],
+        ),
+        data=LeRobotViolaDataConfig(
+            repo_id="IPEC-COMMUNITY/viola_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/openpi/assets/pi0_viola_predictor",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                predictor=True,
+                action_sequence_keys=(
+                    "action",
+                    "observation.images.agentview_rgb",
+                    "observation.images.eye_in_hand_rgb",
+                ),
+            ),
+        ),
+        num_train_steps=80_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+        ),
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=1,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_utaustin_mutex_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_horizon=10,
+            ignore_image_keys=["right_wrist_0_rgb"],
+        ),
+        data=LeRobotHydraDataConfig(
+            repo_id="IPEC-COMMUNITY/utaustin_mutex_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/openpi/assets/pi0_utaustin_mutex_predictor",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                predictor=True,
+                action_sequence_keys=(
+                    "action",
+                    "observation.images.image",
+                    "observation.images.wrist_image",
+                ),
+            ),
+        ),
+        num_train_steps=80_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
