@@ -286,7 +286,9 @@ def log_predicted_images(
     wandb.log({"predicted_future_images": images_to_log}, step=step)
 
 
-def main(config: _config.TrainConfig):
+# def main(config: _config.TrainConfig):
+def main(configs: list[_config.TrainConfig]):
+    config = configs[0]  # For now, just use the first config.
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -316,10 +318,16 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_ssv2_dataloader(
-        config,
+    # data_loader = _data_loader.create_ssv2_dataloader(
+    #     config,
+    #     sharding=data_sharding,
+    #     shuffle=True,
+    # )
+    data_loader = _data_loader.create_pretrain_data_loader(
+        configs,
         sharding=data_sharding,
         shuffle=True,
+        # skip_norm_stats=True,
     )
     data_iter = iter(data_loader)
 
@@ -401,4 +409,12 @@ def main(config: _config.TrainConfig):
 
 
 if __name__ == "__main__":
-    main(_config.cli())
+    # main(_config.cli())
+    configs = [
+        _config.get_config("pi0_ssv2_predictor"),
+        _config.get_config("pi0_hydra_predictor"),
+        _config.get_config("pi0_viola_predictor"),
+        _config.get_config("pi0_utaustin_mutex_predictor"),
+        
+    ]
+    main(configs)
