@@ -8,7 +8,7 @@ from datasets import Dataset as ds, DatasetDict
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import numpy as np
 import torch
 import io
@@ -144,9 +144,6 @@ def create_torch_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
     model_config: _model.BaseModelConfig,
-    *,
-    train: bool = True,
-    val_split: float = 0.1,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -154,10 +151,16 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if "ssv2" in repo_id.lower():
+        return SomethingSomethingV2Dataset(
+            data_config,
+            action_horizon=action_horizon,
+            model_config=model_config,
+        )
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = LeRobotDatasetMetadata(repo_id)
     horizon = range(action_horizon)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset = LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in horizon]
@@ -292,7 +295,12 @@ def transform_dataset(
 ) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if (
+        data_config.repo_id != "fake"
+        and not skip_norm_stats
+        and type(data_config.repo_id) is str
+        and "ssv2" not in data_config.repo_id.lower()
+    ):
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -376,6 +384,43 @@ def create_ssv2_dataloader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+def create_pretrain_data_loader(
+    configs: list[_config.TrainConfig],
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False,
+):
+    data_config = None
+    datasets = []
+    for config in configs:
+        data_config = config.data.create(config.assets_dirs, config.model)
+        dataset = create_torch_dataset(
+            data_config, config.model.action_horizon, config.model
+        )
+        dataset = transform_dataset(
+            dataset, data_config, skip_norm_stats=skip_norm_stats
+        )
+
+        datasets.append(typing.cast(torch.utils.data.Dataset, dataset))
+
+    if data_config is None:
+        raise ValueError("No data config found to create pretrain data loader.")
+    
+    combined_dataset = torch.utils.data.ConcatDataset(datasets)
+    data_loader = TorchDataLoader(
+        combined_dataset,
+        local_batch_size=configs[0].batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=configs[0].num_workers,
+        seed=configs[0].seed,
+    )
+    return DataLoaderImpl(data_config, data_loader)
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -383,8 +428,6 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
-    train: bool = True,
-    val_split: float = 0.1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]] | dict:
     """Create a data loader for training."""
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -410,8 +453,6 @@ def create_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
-        train=train,
-        val_split=val_split,
     )
 
 
@@ -427,8 +468,6 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
-    train: bool = True,
-    val_split: float = 0.1,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -447,9 +486,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(
-        data_config, action_horizon, model_config, train=train, val_split=val_split
-    )
+    dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
