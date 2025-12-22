@@ -81,55 +81,21 @@ def init_wandb(
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-# def _load_weights_and_validate(
-#     loader: _weight_loaders.WeightLoader, params_shape: at.Params
-# ) -> at.Params:
-#     """Loads and validates the weights. Returns a loaded subset of the weights."""
-#     loaded_params = loader.load(params_shape)
-#     # at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
-
-#     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
-#     return traverse_util.unflatten_dict(
-#         {
-#             k: v
-#             for k, v in traverse_util.flatten_dict(loaded_params).items()
-#             if not isinstance(v, jax.ShapeDtypeStruct)
-#         }
-#     )
-
-
 def _load_weights_and_validate(
-    loader: _weight_loaders.WeightLoader,
-    params_shape: at.Params,
-    exclude_patterns: list[str] | None = None,
+    loader: _weight_loaders.WeightLoader, params_shape: at.Params
 ) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
+    # at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params.
-    flat_params = traverse_util.unflatten_dict(
+    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    return traverse_util.unflatten_dict(
         {
             k: v
             for k, v in traverse_util.flatten_dict(loaded_params).items()
             if not isinstance(v, jax.ShapeDtypeStruct)
         }
     )
-
-    # Filter out excluded patterns (e.g., frozen pretrained weights)
-    def exclude_keys(d, keys):
-        if not isinstance(d, dict):
-            return d
-        return {
-            k: exclude_keys(v, keys)
-            for k, v in d.items()
-            if k not in keys
-        }
-
-    if exclude_patterns:
-        keys_to_exclude = set(exclude_patterns)
-        flat_params = exclude_keys(flat_params, keys_to_exclude)
-        
-    return flat_params
 
 
 @at.typecheck
@@ -188,9 +154,6 @@ def init_train_state(
     partial_params = _load_weights_and_validate(
         config.weight_loader,
         train_state_shape.params.to_pure_dict(),
-        exclude_patterns=[
-            "_clip_params",
-        ],  # Exclude pretrained frozen weights
     )
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -349,8 +312,6 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
-        train=True,
-        val_split=config.val_split,
     )
     data_iter = iter(data_loader)
 
