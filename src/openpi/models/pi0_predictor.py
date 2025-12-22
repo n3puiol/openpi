@@ -13,19 +13,15 @@ import jax.numpy as jnp
 from openpi.models.dit import DiffusionTransformer, MultiViewVideoTransformer
 
 from diffusers import FlaxAutoencoderKL
-from transformers import FlaxCLIPTextModel
 
 
 @dataclasses.dataclass(frozen=True)
 class Pi0PredictorConfig(_model.BaseModelConfig):
     in_channel: int = 4
     hidden_size: int = 1024
-    num_heads: int = 8
-    num_layers: int = 12
-    freq_dim: int = 256
-    video_depth: int = 6
-    eps: float = 1e-5
-    # image_key: str = "base_0_rgb"
+    num_heads: int = 16
+    num_layers: int = 24
+    video_depth: int = 12
     horizon: int = 5
     history_len: int = 5
     num_denoise_steps: int = 12
@@ -35,7 +31,7 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
 
     action_dim: int = 32
     action_horizon: int = 10
-    max_token_len: int = 48
+    max_token_len: int = 100
 
     @override
     def inputs_spec(
@@ -87,8 +83,7 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
         dit_filter = nnx_utils.PathRegex("_diffusion_transformer.*")
         ae_filter = nnx_utils.PathRegex("_action_embedder.*")
         ve_filter = nnx_utils.PathRegex("_video_encoder.*")
-        tp_filter = nnx_utils.PathRegex("_task_proj.*")
-        trainable = nnx.Any(dit_filter, ae_filter, ve_filter, tp_filter)
+        trainable = nnx.Any(dit_filter, ae_filter, ve_filter)
         return nnx.Not(trainable)
 
 
@@ -96,7 +91,6 @@ class Pi0PredictorConfig(_model.BaseModelConfig):
 class Pi0Predictor(_model.BaseModel):
     def __init__(self, config: Pi0PredictorConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
-        self._eps = config.eps
         self._primary_image_key = config.primary_image_key
         self._ignore_image_keys = config.ignore_image_keys
 
@@ -111,17 +105,6 @@ class Pi0Predictor(_model.BaseModel):
         self._vae = vae
         self._vae_params = jax.tree_util.tree_map(lambda x: nnx.Param(x), vae_params)
         self._vae_scaling_factor = vae.config.scaling_factor
-
-        clip_model = FlaxCLIPTextModel.from_pretrained(
-            "openai/clip-vit-base-patch32", dtype=jnp.float32
-        )
-
-        self._clip_module = clip_model.module
-        self._clip_params = jax.tree_util.tree_map(
-            lambda x: nnx.Param(x), clip_model.params
-        )
-
-        self._task_proj = nnx.Linear(512, config.hidden_size, rngs=rngs)
 
         self._video_encoder = MultiViewVideoTransformer(
             in_channel=config.in_channel,
@@ -145,7 +128,6 @@ class Pi0Predictor(_model.BaseModel):
     ) -> jnp.ndarray:
         """Encode images using the VAE encoder."""
         images_trans = jnp.transpose(images, (0, 3, 1, 2))
-
         vae_params_raw = jax.tree_util.tree_map(lambda x: x.value, self._vae_params)
 
         posterior = self._vae.apply(
@@ -155,36 +137,6 @@ class Pi0Predictor(_model.BaseModel):
         latents = posterior.latent_dist.sample(rng)
         latents = latents * self._vae_scaling_factor
         return latents
-
-    def encode_text(self, observation: _model.Observation) -> jnp.ndarray:
-        """Encode task descriptions using CLIP."""
-        input_ids = observation.tokenized_prompt
-        attention_mask = observation.tokenized_prompt_mask
-
-        # Generate position_ids based on input shape
-        batch_size, seq_len = input_ids.shape
-        position_ids = jnp.broadcast_to(
-            jnp.arange(seq_len)[None, :], (batch_size, seq_len)
-        )
-
-        text_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-
-        clip_params_raw = jax.tree_util.tree_map(lambda x: x.value, self._clip_params)
-
-        outputs = self._clip_module.apply(
-            {"params": clip_params_raw},
-            **text_inputs,
-            deterministic=True,
-        )
-
-        # Return pooled output (CLS token) for task conditioning
-        # Stop gradient to keep CLIP frozen
-        pooled = jax.lax.stop_gradient(outputs.pooler_output)  # [B, 512]
-        return pooled
 
     def embed_inputs_multi_view(
         self, observation: _model.Observation, train: bool, rng: at.KeyArrayLike
@@ -251,9 +203,6 @@ class Pi0Predictor(_model.BaseModel):
             obs_p, train=train, rng=rng_embed
         )
 
-        task_embedding = self.encode_text(obs_p)  # [B, 512]
-        task_features = self._task_proj(task_embedding)  # [B, hidden_size]
-
         # Reshape embeddings to [B, T, N, C] format
         # Assuming temporal dimension is handled in observation structure
         # Each embedding is [B*T, N, C], reshape to [B, T, N, C]
@@ -290,7 +239,6 @@ class Pi0Predictor(_model.BaseModel):
         v_pred = self._diffusion_transformer(
             x_noisy=x_t,
             history_features=history_features,
-            task_features=task_features,
             action_tokens=action_features,
             timestep=timestep,
         )
@@ -389,10 +337,6 @@ class Pi0Predictor(_model.BaseModel):
             obs_p, train=False, rng=rng_embed
         )
 
-        # Encode task text
-        task_embedding = self.encode_text(obs_p)  # [B, 512]
-        task_features = self._task_proj(task_embedding)  # [B, hidden_size]
-
         view_embeddings_reshaped = []
         for emb in all_view_embeddings:
             emb_reshaped = jnp.reshape(emb, (b, t, -1, 4))
@@ -428,7 +372,6 @@ class Pi0Predictor(_model.BaseModel):
             v_pred = self._diffusion_transformer(
                 x_noisy=x_curr,
                 history_features=history_features,
-                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_batch,
             )
@@ -444,7 +387,6 @@ class Pi0Predictor(_model.BaseModel):
             k1 = self._diffusion_transformer(
                 x_noisy=x_curr,
                 history_features=history_features,
-                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_batch,
             )
@@ -454,7 +396,6 @@ class Pi0Predictor(_model.BaseModel):
             k2 = self._diffusion_transformer(
                 x_noisy=x_pred,
                 history_features=history_features,
-                task_features=task_features,
                 action_tokens=action_features,
                 timestep=t_next_batch,
             )
