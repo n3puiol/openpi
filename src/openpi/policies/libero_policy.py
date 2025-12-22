@@ -50,7 +50,7 @@ class LiberoInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-        mask_padding = self.model_type == _model.ModelType.PI0
+        mask_padding = self.model_type == _model.ModelType.PI0 or self.model_type == _model.ModelType.PI0_PREDICTOR
 
         # We pad the proprioceptive input to the action dimension of the model.
         # For pi0-FAST, we don't pad the state. For Libero, we don't need to differentiate
