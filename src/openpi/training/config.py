@@ -397,23 +397,39 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotHydraDataConfig(DataConfigFactory):
+class LeRobotGenericDataConfig(DataConfigFactory):
+    """Generic LeRobot data config that supports flexible image and action key mappings.
+
+    This config can be used for datasets with different key naming conventions.
+    The repack transform is automatically built based on the action_sequence_keys.
+    """
+    # Mapping from dataset keys to target keys for observation images
+    observation_image_mappings: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {
+            "observation/image": "observation.images.image",
+            "observation/wrist_image": "observation.images.wrist_image",
+        }
+    )
+    # Action key in the dataset
+    dataset_action_key: str = "action"
+    # Action sequence keys that will be used by the data loader
+    action_sequence_keys: Sequence[str] = ("action",)
+
     @override
     def create(
         self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
     ) -> DataConfig:
+        # Build repack mappings dynamically based on action_sequence_keys
+        repack_mappings = {**self.observation_image_mappings}
+        repack_mappings["observation/state"] = "observation.state"
+        repack_mappings["prompt"] = "prompt"
+
+        # Map the dataset action key to the first action sequence key
+        # The remaining keys (if any) are assumed to be image keys for predictor models
+        repack_mappings["actions"] = self.action_sequence_keys[0]
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.image",
-                        "observation/wrist_image": "observation.images.wrist_image",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mappings)]
         )
 
         data_transforms = _transforms.Group(
@@ -433,47 +449,47 @@ class LeRobotHydraDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
 @dataclasses.dataclass(frozen=True)
-class LeRobotViolaDataConfig(DataConfigFactory):
-    @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.agentview_rgb",
-                        "observation/wrist_image": "observation.images.eye_in_hand_rgb",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+class LeRobotHydraDataConfig(LeRobotGenericDataConfig):
+    """Data config for Hydra dataset with default image key mappings."""
+    observation_image_mappings: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {
+            "observation/image": "observation.images.image",
+            "observation/wrist_image": "observation.images.wrist_image",
+        }
+    )
+    dataset_action_key: str = "action"
+    action_sequence_keys: Sequence[str] = ("action",)
 
-        data_transforms = _transforms.Group(
-            inputs=[
-                libero_policy.LiberoInputs(
-                    action_dim=model_config.action_dim,
-                    model_type=model_config.model_type,
-                )
-            ],
-            outputs=[libero_policy.LiberoOutputs()],
-        )
 
-        model_transforms = ModelTransformFactory()(model_config)
+@dataclasses.dataclass(frozen=True)
+class LeRobotViolaDataConfig(LeRobotGenericDataConfig):
+    """Data config for Viola dataset with agentview and eye-in-hand image mappings."""
+    observation_image_mappings: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {
+            "observation/image": "observation.images.agentview_rgb",
+            "observation/wrist_image": "observation.images.eye_in_hand_rgb",
+        }
+    )
+    dataset_action_key: str = "action"
+    action_sequence_keys: Sequence[str] = ("action",)
 
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFractalDataConfig(LeRobotGenericDataConfig):
+    """Data config for Fractal with image mapping."""
+
+    observation_image_mappings: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {
+            "observation/image": "observation.images.image",
+        }
+    )
+    dataset_action_key: str = "action"
+    action_sequence_keys: Sequence[str] = ("action",)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -755,14 +771,10 @@ _CONFIGS = [
         ),
         data=SSV2DataConfig(
             repo_id="/scratch/s5649552/.cache/data/ssv2_parquet",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="franka",
-            ),
         ),
-        num_train_steps=80_000,
+        num_train_steps=200_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
+            warmup_steps=50_000, peak_lr=3e-5, decay_steps=200_000, decay_lr=1e-6
         ),
         optimizer=_optimizer.AdamW(
             b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
@@ -820,14 +832,14 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/scratch/s5649552/openpi/assets/pi0_hydra_predictor",
             ),
+            action_sequence_keys=(
+                "action",
+                "observation.images.image",
+                "observation.images.wrist_image",
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
-                action_sequence_keys=(
-                    "action",
-                    "observation.images.image",
-                    "observation.images.wrist_image",
-                ),
             ),
         ),
         num_train_steps=80_000,
@@ -852,14 +864,45 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/scratch/s5649552/openpi/assets/pi0_viola_predictor",
             ),
+            action_sequence_keys=(
+                "action",
+                "observation.images.agentview_rgb",
+                "observation.images.eye_in_hand_rgb",
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
-                action_sequence_keys=(
-                    "action",
-                    "observation.images.agentview_rgb",
-                    "observation.images.eye_in_hand_rgb",
-                ),
+            ),
+        ),
+        num_train_steps=80_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20_000, peak_lr=3e-5, decay_steps=80_000, decay_lr=1e-6
+        ),
+        optimizer=_optimizer.AdamW(
+            b1=0.9, b2=0.98, eps=1e-8, weight_decay=1e-4, clip_gradient_norm=1.0
+        ),
+        freeze_filter=pi0_predictor.Pi0PredictorConfig().get_freeze_filter(),
+        batch_size=1,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_fractal_predictor",
+        model=pi0_predictor.Pi0PredictorConfig(
+            action_horizon=10,
+            ignore_image_keys=["right_wrist_0_rgb"],
+        ),
+        data=LeRobotFractalDataConfig(
+            repo_id="IPEC-COMMUNITY/fractal20220817_data_lerobot",
+            assets=AssetsConfig(
+                assets_dir="/scratch/s5649552/openpi/assets/pi0_fractal_predictor",
+            ),
+            action_sequence_keys=(
+                "action",
+                "observation.images.image",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                predictor=True,
             ),
         ),
         num_train_steps=80_000,
@@ -884,14 +927,14 @@ _CONFIGS = [
             assets=AssetsConfig(
                 assets_dir="/scratch/s5649552/openpi/assets/pi0_utaustin_mutex_predictor",
             ),
+            action_sequence_keys=(
+                "action",
+                "observation.images.image",
+                "observation.images.wrist_image",
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 predictor=True,
-                action_sequence_keys=(
-                    "action",
-                    "observation.images.image",
-                    "observation.images.wrist_image",
-                ),
             ),
         ),
         num_train_steps=80_000,
